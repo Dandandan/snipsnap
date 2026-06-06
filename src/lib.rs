@@ -933,7 +933,9 @@ impl RawEncoder {
             }
             &mut self.big[..table_size]
         };
-        table.fill(0);
+        for slot in &mut *table {
+            *slot = 0;
+        }
         (table, shift)
     }
 }
@@ -946,7 +948,7 @@ fn should_emit_literal_only(input: &[u8]) -> bool {
         return false;
     }
 
-    const SAMPLE_LEN: usize = 512;
+    const SAMPLE_LEN: usize = 128;
     let sample_len = input.len().min(SAMPLE_LEN);
     let mut table = [usize::MAX; 256];
     for pos in 0..sample_len - 3 {
@@ -985,7 +987,7 @@ fn compress_block(
     let mut next_hash = hash(load_u32_le(src, src_pos), shift);
 
     loop {
-        let mut skip = 32usize;
+        let mut skip = 128usize;
         let mut candidate;
         let mut src_next = src_pos;
         loop {
@@ -1064,6 +1066,17 @@ fn emit_literal(
     if n <= 59 {
         dst[*dst_pos] = (n as u8) << 2;
         *dst_pos += 1;
+        if len <= 16 && start + 16 <= src.len() {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    src.as_ptr().add(start),
+                    dst.as_mut_ptr().add(*dst_pos),
+                    16,
+                );
+            }
+            *dst_pos += len;
+            return;
+        }
     } else if n < 256 {
         dst[*dst_pos] = 60 << 2;
         dst[*dst_pos + 1] = n as u8;

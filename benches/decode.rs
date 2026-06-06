@@ -112,6 +112,57 @@ fn arrowish_strings(len: usize) -> Vec<u8> {
     out
 }
 
+const FILE_CASES: &[(&str, &[u8])] = &[
+    (
+        "data_html",
+        include_bytes!("../tests/rust-snappy-data/html"),
+    ),
+    (
+        "data_urls",
+        include_bytes!("../tests/rust-snappy-data/urls.10K"),
+    ),
+    (
+        "data_jpg",
+        include_bytes!("../tests/rust-snappy-data/fireworks.jpeg"),
+    ),
+    (
+        "data_pdf",
+        include_bytes!("../tests/rust-snappy-data/paper-100k.pdf"),
+    ),
+    (
+        "data_html4",
+        include_bytes!("../tests/rust-snappy-data/html_x_4"),
+    ),
+    (
+        "data_txt1",
+        include_bytes!("../tests/rust-snappy-data/alice29.txt"),
+    ),
+    (
+        "data_txt2",
+        include_bytes!("../tests/rust-snappy-data/asyoulik.txt"),
+    ),
+    (
+        "data_txt3",
+        include_bytes!("../tests/rust-snappy-data/lcet10.txt"),
+    ),
+    (
+        "data_txt4",
+        include_bytes!("../tests/rust-snappy-data/plrabn12.txt"),
+    ),
+    (
+        "data_pb",
+        include_bytes!("../tests/rust-snappy-data/geo.protodata"),
+    ),
+    (
+        "data_gaviota",
+        include_bytes!("../tests/rust-snappy-data/kppkn.gtb"),
+    ),
+    (
+        "data_golden",
+        include_bytes!("../tests/rust-snappy-data/Mark.Twain-Tom.Sawyer.txt"),
+    ),
+];
+
 #[derive(Clone)]
 struct SnappyBlock {
     compressed: Vec<u8>,
@@ -499,6 +550,11 @@ fn bench_decode(c: &mut Criterion) {
     for (name, data) in cases {
         bench_case(c, name, data.clone());
         bench_encode_case(c, name, data);
+    }
+
+    for &(name, data) in FILE_CASES {
+        bench_case(c, name, data.to_vec());
+        bench_encode_case(c, name, data.to_vec());
     }
 
     let clickbench_blocks = clickbench_snappy_blocks();

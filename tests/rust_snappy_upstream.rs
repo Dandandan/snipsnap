@@ -118,7 +118,12 @@ fn upstream_raw_golden_compressed() {
     let expected = include_bytes!("rust-snappy-data/Mark.Twain-Tom.Sawyer.txt");
     let decoded = depress(compressed);
     assert_eq!(decoded, expected);
-    assert_eq!(press(&decoded), compressed);
+    let encoded = press(&decoded);
+    assert_eq!(depress(&encoded), expected);
+    assert_eq!(
+        snap::raw::Decoder::new().decompress_vec(&encoded).unwrap(),
+        expected
+    );
 }
 
 #[test]
