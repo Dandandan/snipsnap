@@ -1,0 +1,40 @@
+[package]
+name = "snipsnap"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Small, fast Snappy raw block and framed stream encoder/decoder"
+license = "Apache-2.0"
+repository = "https://github.com/Dandandan/snipsnap"
+readme = "README.md"
+keywords = ["snappy", "compression", "decompression"]
+categories = ["compression"]
+build = "build.rs"
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "build.rs",
+    "src/**",
+    "tests/**",
+    "benches/**",
+    "examples/**",
+]
+
+[workspace]
+
+[lib]
+bench = false
+
+[dev-dependencies]
+criterion = "0.5.1"
+parquet = { version = "58.3.0", default-features = false }
+quickcheck = { version = "0.9", default-features = false }
+rand = "0.7.3"
+snap = "1.1.1"
+thrift = "0.17"
+
+[[bench]]
+name = "decode"
+harness = false

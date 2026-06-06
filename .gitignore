@@ -1,0 +1,4 @@
+/target/
+/.criterion/
+*.profraw
+*.profdata
