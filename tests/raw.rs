@@ -141,6 +141,35 @@ fn handmade_tags() {
         );
     }
 
+    let prefix = vec![b'p'; 900];
+    let suffix = vec![b's'; 100];
+    let mut offset1_after_literal = Vec::new();
+    raw_header(
+        prefix.len() + 1 + 64 + suffix.len(),
+        &mut offset1_after_literal,
+    );
+    for chunk in prefix.chunks(60) {
+        raw_literal(chunk, &mut offset1_after_literal);
+    }
+    raw_literal(b"z", &mut offset1_after_literal);
+    raw_copy2(64, 1, &mut offset1_after_literal);
+    raw_literal(&suffix, &mut offset1_after_literal);
+
+    let mut expected = prefix;
+    expected.extend(std::iter::repeat_n(b'z', 65));
+    expected.extend(suffix);
+    assert_eq!(
+        snipsnap::decompress(&offset1_after_literal).unwrap(),
+        expected,
+        "table path offset-1 copy after a short literal"
+    );
+    assert_eq!(
+        snap::raw::Decoder::new()
+            .decompress_vec(&offset1_after_literal)
+            .unwrap(),
+        expected
+    );
+
     for offset in [8usize, 9, 10, 15, 16, 17, 37] {
         let copy_len = 38usize;
         let total_len = offset + copy_len;

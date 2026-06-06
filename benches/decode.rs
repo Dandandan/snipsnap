@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs::File,
     io::{Read, Seek, SeekFrom},
     mem::MaybeUninit,
@@ -196,8 +197,7 @@ fn read_page_header(src: &[u8]) -> Option<(usize, PageHeader)> {
 }
 
 #[allow(deprecated)]
-fn clickbench_snappy_blocks() -> Vec<SnappyBlock> {
-    let path = "../datafusion/core/tests/data/clickbench_hits_10.parquet";
+fn parquet_snappy_blocks(path: &str) -> Vec<SnappyBlock> {
     let file = File::open(path).unwrap_or_else(|error| {
         panic!("failed to open ClickBench fixture {path}: {error}")
     });
@@ -269,6 +269,11 @@ fn clickbench_snappy_blocks() -> Vec<SnappyBlock> {
 
     assert!(!blocks.is_empty(), "no Snappy pages found in {path}");
     blocks
+}
+
+#[allow(deprecated)]
+fn clickbench_snappy_blocks() -> Vec<SnappyBlock> {
+    parquet_snappy_blocks("../datafusion/core/tests/data/clickbench_hits_10.parquet")
 }
 
 fn bench_case(c: &mut Criterion, name: &str, data: Vec<u8>) {
@@ -560,6 +565,11 @@ fn bench_decode(c: &mut Criterion) {
     let clickbench_blocks = clickbench_snappy_blocks();
     bench_blocks(c, "clickbench_pages", clickbench_blocks.clone());
     bench_encode_blocks(c, "encode_clickbench_pages", clickbench_blocks);
+
+    if let Ok(path) = env::var("SNIPSNAP_PARQUET_BENCH") {
+        let blocks = parquet_snappy_blocks(&path);
+        bench_blocks(c, "external_parquet_pages", blocks);
+    }
 }
 
 criterion_group!(benches, bench_decode);

@@ -20,6 +20,24 @@ const MIN_NON_LITERAL_BLOCK_SIZE: usize = 1 + 1 + INPUT_MARGIN;
 const EXACT_COPY_TAG_MIN_LEN: usize = 1024;
 const BULK_COPY_RUN_MIN_LEN: usize = 64 * 1024;
 const BULK_COPY_RUN_MIN_COPIES: usize = 4;
+const TEXT_STREAM_MAX_RATIO: usize = 10;
+#[cfg(not(target_arch = "aarch64"))]
+const WORD_MASK: [usize; 5] = [0, 0xff, 0xffff, 0xff_ffff, 0xffff_ffff];
+const COPY_TAG_TABLE: [u16; 256] = build_copy_tag_table();
+
+#[inline(always)]
+fn word_mask(byte_count: usize) -> usize {
+    debug_assert!((1..=4).contains(&byte_count));
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        (u32::MAX >> ((4 - byte_count as u32) << 3)) as usize
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        WORD_MASK[byte_count]
+    }
+}
 
 /// Result type for Snappy encoding and decoding.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -150,7 +168,7 @@ impl From<Error> for io::Error {
 
 #[cold]
 #[inline(never)]
-fn decode_error(error: Error) -> Result<()> {
+fn decode_error<T>(error: Error) -> Result<T> {
     Err(error)
 }
 
@@ -214,6 +232,12 @@ pub fn decompress_into_uninit<'a>(
         if !try_decode_tiny(body, dst) {
             decode_body::<false, false>(body, dst)?;
         }
+    } else if len <= body.len() {
+        if !try_decode_literal_only(body, dst) {
+            decode_body_table(body, dst)?;
+        }
+    } else if len <= body.len() * TEXT_STREAM_MAX_RATIO {
+        decode_body_table(body, dst)?;
     } else if len < BULK_COPY_RUN_MIN_LEN {
         decode_body::<true, false>(body, dst)?;
     } else {
@@ -1281,6 +1305,11 @@ fn try_decode_tiny(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> bool {
                 }
                 ip += len;
                 op += len;
+                unsafe {
+                    copy_table_short_copy_after_literal(
+                        src_ptr, src_len, dst_ptr, dst_len, &mut ip, &mut op,
+                    );
+                }
             }
             1 => {
                 if ip >= src_len {
@@ -1400,6 +1429,598 @@ fn try_copy_tiny_match(
         }
     }
     true
+}
+
+#[inline(always)]
+fn try_decode_literal_only(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> bool {
+    let src_len = src.len();
+    let dst_len = dst.len();
+    let src_ptr = src.as_ptr();
+    let dst_ptr = dst.as_mut_ptr().cast::<u8>();
+    let mut ip = 0usize;
+    let mut op = 0usize;
+
+    while ip < src_len {
+        let tag = unsafe { *src_ptr.add(ip) };
+        ip += 1;
+        if tag & 3 != 0 {
+            return false;
+        }
+
+        let mut len = usize::from(tag >> 2) + 1;
+        if len > 60 {
+            let len_bytes = len - 60;
+            if len_bytes > src_len - ip || 4 > src_len - ip {
+                return false;
+            }
+            len = (unsafe { read_u32(src_ptr.add(ip)) as usize } & word_mask(len_bytes))
+                + 1;
+            ip += len_bytes;
+        }
+        if len > src_len - ip || len > dst_len - op {
+            return false;
+        }
+
+        ip += len;
+        op += len;
+    }
+
+    if op != dst_len {
+        return false;
+    }
+
+    ip = 0;
+    op = 0;
+    while ip < src_len {
+        let tag = unsafe { *src_ptr.add(ip) };
+        ip += 1;
+
+        let mut len = usize::from(tag >> 2) + 1;
+        if len > 60 {
+            let len_bytes = len - 60;
+            len = (unsafe { read_u32(src_ptr.add(ip)) as usize } & word_mask(len_bytes))
+                + 1;
+            ip += len_bytes;
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(src_ptr.add(ip), dst_ptr.add(op), len);
+        }
+        ip += len;
+        op += len;
+    }
+
+    true
+}
+
+const fn build_copy_tag_table() -> [u16; 256] {
+    let mut table = [0u16; 256];
+    let mut tag = 0usize;
+    while tag < 256 {
+        let entry = match tag & 3 {
+            1 => {
+                let len = 4 + ((tag >> 2) & 7);
+                let offset_high = (tag & 0xe0) << 3;
+                (1 << 11) | offset_high | len
+            }
+            2 => {
+                let len = 1 + (tag >> 2);
+                (2 << 11) | len
+            }
+            3 => {
+                let len = 1 + (tag >> 2);
+                (4 << 11) | len
+            }
+            _ => 0,
+        };
+        table[tag] = entry as u16;
+        tag += 1;
+    }
+    table
+}
+
+#[inline(always)]
+fn decode_body_table_fast(
+    src: &[u8],
+    dst: &mut [MaybeUninit<u8>],
+) -> Result<(usize, usize)> {
+    let src_len = src.len();
+    let dst_len = dst.len();
+    let src_ptr = src.as_ptr();
+    let dst_ptr = dst.as_mut_ptr().cast::<u8>();
+    let mut ip = 0usize;
+    let mut op = 0usize;
+
+    if src_len >= 17 && dst_len >= 88 {
+        let ip_limit = src_len - 17;
+        let op_limit = dst_len - 88;
+        let mut preload = unsafe { u32::from(*src_ptr.add(ip)) };
+        let mut next_entry = usize::from(COPY_TAG_TABLE[preload as u8 as usize]);
+        let mut next_loaded = unsafe { read_u32(src_ptr.add(ip + 1)) };
+
+        loop {
+            let tag = preload as u8;
+            if tag & 3 != 0 {
+                let loaded = next_loaded;
+                let tag_type = usize::from(tag & 3);
+                if tag_type == 3 {
+                    break;
+                }
+
+                let entry = next_entry;
+                let len = entry & 0xff;
+                ip += 1 + tag_type;
+
+                let mask = (1u32 << (tag_type as u32 * 8)).wrapping_sub(1);
+                let offset = (entry & 0x700) | ((loaded & mask) as usize);
+                let copy_dst = unsafe { dst_ptr.add(op) };
+                if op <= offset.wrapping_sub(1) {
+                    return decode_error(Error::Offset {
+                        offset,
+                        dst_pos: op,
+                    });
+                }
+
+                preload = loaded >> (tag_type as u32 * 8);
+                next_entry = usize::from(COPY_TAG_TABLE[preload as u8 as usize]);
+                next_loaded = unsafe { read_u32(src_ptr.add(ip + 1)) };
+
+                unsafe {
+                    copy_table_match_fast(copy_dst, offset, len);
+                }
+                op += len;
+            } else {
+                ip += 1;
+                let len = if tag <= 0x3c {
+                    let len = usize::from(tag >> 2) + 1;
+                    unsafe {
+                        ptr::copy_nonoverlapping(src_ptr.add(ip), dst_ptr.add(op), 16);
+                    }
+                    ip += len;
+                    op += len;
+                    if ip > ip_limit || op > op_limit {
+                        break;
+                    }
+                    preload = unsafe { u32::from(*src_ptr.add(ip)) };
+                    next_entry = usize::from(COPY_TAG_TABLE[preload as u8 as usize]);
+                    next_loaded = unsafe { read_u32(src_ptr.add(ip + 1)) };
+                    continue;
+                } else if tag <= 0xec {
+                    usize::from(tag >> 2) + 1
+                } else {
+                    let (next_ip, next_op) = unsafe {
+                        decode_long_literal_fast(
+                            src_ptr, src_len, dst_ptr, dst_len, ip, op, tag,
+                        )?
+                    };
+                    ip = next_ip;
+                    op = next_op;
+                    if ip > ip_limit || op > op_limit {
+                        break;
+                    }
+                    preload = unsafe { u32::from(*src_ptr.add(ip)) };
+                    next_entry = usize::from(COPY_TAG_TABLE[preload as u8 as usize]);
+                    next_loaded = unsafe { read_u32(src_ptr.add(ip + 1)) };
+                    continue;
+                };
+
+                if len <= 64 && ip + 64 <= src_len {
+                    unsafe {
+                        copy_literal_wide(src_ptr.add(ip), dst_ptr.add(op), len);
+                    }
+                } else {
+                    if len > src_len - ip {
+                        return decode_error(Error::LiteralRead {
+                            len: len as u64,
+                            remaining: (src_len - ip) as u64,
+                        });
+                    }
+                    if len > dst_len - op {
+                        return decode_error(Error::LiteralWrite {
+                            len: len as u64,
+                            remaining: (dst_len - op) as u64,
+                        });
+                    }
+                    unsafe {
+                        ptr::copy_nonoverlapping(src_ptr.add(ip), dst_ptr.add(op), len);
+                    }
+                }
+                ip += len;
+                op += len;
+
+                if ip > ip_limit || op > op_limit {
+                    break;
+                }
+                preload = unsafe { u32::from(*src_ptr.add(ip)) };
+                next_entry = usize::from(COPY_TAG_TABLE[preload as u8 as usize]);
+                next_loaded = unsafe { read_u32(src_ptr.add(ip + 1)) };
+            }
+
+            if ip > ip_limit || op > op_limit {
+                break;
+            }
+        }
+    }
+
+    Ok((ip, op))
+}
+
+#[inline(never)]
+fn decode_body_table(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
+    let src_len = src.len();
+    let dst_len = dst.len();
+    let (mut ip, mut op) = decode_body_table_fast(src, dst)?;
+    let src_ptr = src.as_ptr();
+    let dst_ptr = dst.as_mut_ptr().cast::<u8>();
+    let fast_short_literals = dst_len <= src_len.saturating_mul(2);
+
+    while ip < src_len {
+        let tag = unsafe { *src_ptr.add(ip) };
+        ip += 1;
+
+        if fast_short_literals
+            && tag & 3 == 0
+            && tag <= 0x3c
+            && 16 <= src_len - ip
+            && 16 <= dst_len - op
+        {
+            let len = usize::from(tag >> 2) + 1;
+            unsafe {
+                ptr::copy_nonoverlapping(src_ptr.add(ip), dst_ptr.add(op), 16);
+            }
+            ip += len;
+            op += len;
+            unsafe {
+                copy_table_short_copy_after_literal(
+                    src_ptr, src_len, dst_ptr, dst_len, &mut ip, &mut op,
+                );
+            }
+            continue;
+        }
+
+        if tag & 3 == 0 {
+            let mut len = usize::from(tag >> 2) + 1;
+            if len > 60 {
+                let len_bytes = len - 60;
+                if len_bytes > src_len - ip {
+                    return decode_error(Error::LiteralRead {
+                        len: len_bytes as u64,
+                        remaining: (src_len - ip) as u64,
+                    });
+                }
+                if 4 > src_len - ip {
+                    return decode_error(Error::LiteralRead {
+                        len: 4,
+                        remaining: (src_len - ip) as u64,
+                    });
+                }
+                len = (unsafe { read_u32(src_ptr.add(ip)) as usize }
+                    & word_mask(len_bytes))
+                    + 1;
+                ip += len_bytes;
+            }
+            if len > src_len - ip {
+                return decode_error(Error::LiteralRead {
+                    len: len as u64,
+                    remaining: (src_len - ip) as u64,
+                });
+            }
+            if len > dst_len - op {
+                return decode_error(Error::LiteralWrite {
+                    len: len as u64,
+                    remaining: (dst_len - op) as u64,
+                });
+            }
+            unsafe {
+                copy_literal(
+                    src_ptr.add(ip),
+                    dst_ptr.add(op),
+                    len,
+                    src_len - ip,
+                    dst_len - op,
+                );
+            }
+            ip += len;
+            op += len;
+            unsafe {
+                copy_table_short_copy_after_literal(
+                    src_ptr, src_len, dst_ptr, dst_len, &mut ip, &mut op,
+                );
+            }
+            continue;
+        }
+
+        let entry = usize::from(COPY_TAG_TABLE[tag as usize]);
+        let tag_bytes = entry >> 11;
+        let trailer = if ip + 4 <= src_len {
+            (unsafe { read_u32(src_ptr.add(ip)) as usize }) & word_mask(tag_bytes)
+        } else if tag_bytes == 1 {
+            if ip >= src_len {
+                return decode_error(Error::CopyRead {
+                    len: 1,
+                    remaining: 0,
+                });
+            }
+            unsafe { usize::from(*src_ptr.add(ip)) }
+        } else if tag_bytes == 2 {
+            if 2 > src_len - ip {
+                return decode_error(Error::CopyRead {
+                    len: 2,
+                    remaining: (src_len - ip) as u64,
+                });
+            }
+            unsafe { read_u16(src_ptr.add(ip)) }
+        } else {
+            return decode_error(Error::CopyRead {
+                len: tag_bytes as u64,
+                remaining: (src_len - ip) as u64,
+            });
+        };
+        ip += tag_bytes;
+
+        let len = entry & 0xff;
+        let offset = (entry & 0x700) | trailer;
+        unsafe {
+            copy_table_match(dst_ptr, dst_len, &mut op, offset, len)?;
+        }
+    }
+
+    if op != dst_len {
+        return decode_error(Error::HeaderMismatch {
+            expected: dst_len,
+            actual: op,
+        });
+    }
+    Ok(())
+}
+
+#[inline(never)]
+unsafe fn decode_long_literal_fast(
+    src_ptr: *const u8,
+    src_len: usize,
+    dst_ptr: *mut u8,
+    dst_len: usize,
+    mut ip: usize,
+    mut op: usize,
+    tag: u8,
+) -> Result<(usize, usize)> {
+    let len_bytes = usize::from(tag >> 2) + 1 - 60;
+    if len_bytes > src_len - ip {
+        return decode_error(Error::LiteralRead {
+            len: len_bytes as u64,
+            remaining: (src_len - ip) as u64,
+        });
+    }
+    if 4 > src_len - ip {
+        return decode_error(Error::LiteralRead {
+            len: 4,
+            remaining: (src_len - ip) as u64,
+        });
+    }
+
+    let len = (unsafe { read_u32(src_ptr.add(ip)) as usize } & word_mask(len_bytes)) + 1;
+    ip += len_bytes;
+    if len > src_len - ip {
+        return decode_error(Error::LiteralRead {
+            len: len as u64,
+            remaining: (src_len - ip) as u64,
+        });
+    }
+    if len > dst_len - op {
+        return decode_error(Error::LiteralWrite {
+            len: len as u64,
+            remaining: (dst_len - op) as u64,
+        });
+    }
+
+    unsafe {
+        if len <= 64 && ip + 64 <= src_len && op + 64 <= dst_len {
+            copy_literal_wide(src_ptr.add(ip), dst_ptr.add(op), len);
+        } else {
+            ptr::copy_nonoverlapping(src_ptr.add(ip), dst_ptr.add(op), len);
+        }
+    }
+    ip += len;
+    op += len;
+    Ok((ip, op))
+}
+
+#[inline(always)]
+unsafe fn copy_table_match(
+    dst_ptr: *mut u8,
+    dst_len: usize,
+    op: &mut usize,
+    offset: usize,
+    len: usize,
+) -> Result<()> {
+    if *op <= offset.wrapping_sub(1) {
+        return decode_error(Error::Offset {
+            offset,
+            dst_pos: *op,
+        });
+    }
+
+    let end = *op + len;
+    if offset >= 16 && len <= 16 && 16 <= dst_len - *op {
+        unsafe {
+            copy_match_16_exact(dst_ptr.add(*op - offset), dst_ptr.add(*op));
+        }
+    } else if offset >= 8 && len <= 16 && 16 <= dst_len - *op {
+        unsafe {
+            let copy_src = dst_ptr.add(*op - offset);
+            let copy_dst = dst_ptr.add(*op);
+            ptr::copy_nonoverlapping(copy_src, copy_dst, 8);
+            ptr::copy_nonoverlapping(copy_src.add(8), copy_dst.add(8), 8);
+        }
+    } else if end + 24 <= dst_len {
+        unsafe {
+            let mut copy_dst = dst_ptr.add(*op);
+            let mut copy_src = copy_dst.sub(offset);
+            let mut copied_to = *op;
+            loop {
+                let diff = copy_dst as usize - copy_src as usize;
+                if diff >= 16 {
+                    break;
+                }
+                ptr::copy(copy_src, copy_dst, 16);
+                copied_to += diff;
+                copy_dst = copy_dst.add(diff);
+            }
+            while copied_to < end {
+                ptr::copy_nonoverlapping(copy_src, copy_dst, 16);
+                copy_src = copy_src.add(16);
+                copy_dst = copy_dst.add(16);
+                copied_to += 16;
+            }
+        }
+    } else {
+        if len > dst_len - *op {
+            return decode_error(Error::CopyWrite {
+                len: len as u64,
+                remaining: (dst_len - *op) as u64,
+            });
+        }
+        unsafe {
+            copy_match(dst_ptr, dst_len, *op, offset, len)?;
+        }
+    }
+    *op = end;
+    Ok(())
+}
+
+#[inline(always)]
+unsafe fn copy_literal_wide(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!((17..=64).contains(&len));
+    unsafe {
+        ptr::copy_nonoverlapping(src, dst, 32);
+        if len > 32 {
+            ptr::copy_nonoverlapping(src.add(32), dst.add(32), 32);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_table_match_fast(dst: *mut u8, offset: usize, len: usize) {
+    debug_assert!((1..=64).contains(&len));
+    unsafe {
+        if len <= 16 && offset >= 8 {
+            let src = dst.sub(offset);
+            ptr::copy_nonoverlapping(src, dst, 8);
+            ptr::copy_nonoverlapping(src.add(8), dst.add(8), 8);
+        } else {
+            copy_table_match_fast_cold(dst, offset, len);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_table_match_fast_cold(dst: *mut u8, offset: usize, len: usize) {
+    let src = unsafe { dst.sub(offset) };
+    unsafe {
+        if offset >= 32 {
+            ptr::copy_nonoverlapping(src, dst, 32);
+            if len > 32 {
+                ptr::copy_nonoverlapping(src.add(32), dst.add(32), 32);
+            }
+        } else if offset >= 16 {
+            ptr::copy_nonoverlapping(src, dst, 16);
+            ptr::copy_nonoverlapping(src.add(16), dst.add(16), 16);
+            if len > 32 {
+                ptr::copy_nonoverlapping(src.add(32), dst.add(32), 16);
+                if len > 48 {
+                    ptr::copy_nonoverlapping(src.add(48), dst.add(48), 16);
+                }
+            }
+        } else if offset >= len {
+            ptr::copy_nonoverlapping(src, dst, len);
+        } else if offset == 1 {
+            copy_offset1_repeat(dst, *src, len);
+        } else {
+            copy_table_match_fast_overlap(dst, offset, len);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_table_match_fast_overlap(dst: *mut u8, offset: usize, len: usize) {
+    let end = unsafe { dst.add(len) };
+    let mut copy_dst = dst;
+    let mut copy_src = unsafe { dst.sub(offset) };
+    loop {
+        let diff = copy_dst as usize - copy_src as usize;
+        if diff >= 16 {
+            break;
+        }
+        unsafe {
+            ptr::copy(copy_src, copy_dst, 16);
+            copy_dst = copy_dst.add(diff);
+        }
+    }
+    while copy_dst < end {
+        unsafe {
+            ptr::copy_nonoverlapping(copy_src, copy_dst, 16);
+            copy_src = copy_src.add(16);
+            copy_dst = copy_dst.add(16);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_table_short_copy_after_literal(
+    src_ptr: *const u8,
+    src_len: usize,
+    dst_ptr: *mut u8,
+    dst_len: usize,
+    ip: &mut usize,
+    op: &mut usize,
+) {
+    if 2 > src_len - *ip || 16 > dst_len - *op {
+        return;
+    }
+
+    let tag = unsafe { *src_ptr.add(*ip) };
+    if tag & 3 == 1 {
+        let len = 4 + usize::from((tag >> 2) & 7);
+        let offset = (usize::from(tag & 0xe0) << 3)
+            | unsafe { usize::from(*src_ptr.add(*ip + 1)) };
+        if offset >= 16 && offset <= *op {
+            unsafe {
+                copy_match_16_exact(dst_ptr.add(*op - offset), dst_ptr.add(*op));
+            }
+            *ip += 2;
+            *op += len;
+        } else if offset >= 8 && offset <= *op {
+            unsafe {
+                let copy_src = dst_ptr.add(*op - offset);
+                let copy_dst = dst_ptr.add(*op);
+                ptr::copy_nonoverlapping(copy_src, copy_dst, 8);
+                ptr::copy_nonoverlapping(copy_src.add(8), copy_dst.add(8), 8);
+            }
+            *ip += 2;
+            *op += len;
+        }
+    } else if tag & 3 == 2 && 3 <= src_len - *ip {
+        let len = 1 + usize::from(tag >> 2);
+        if len <= 16 {
+            let offset = unsafe { read_u16(src_ptr.add(*ip + 1)) };
+            if offset >= 16 && offset <= *op {
+                unsafe {
+                    copy_match_16_exact(dst_ptr.add(*op - offset), dst_ptr.add(*op));
+                }
+                *ip += 3;
+                *op += len;
+            } else if offset >= 8 && offset <= *op {
+                unsafe {
+                    let copy_src = dst_ptr.add(*op - offset);
+                    let copy_dst = dst_ptr.add(*op);
+                    ptr::copy_nonoverlapping(copy_src, copy_dst, 8);
+                    ptr::copy_nonoverlapping(copy_src.add(8), copy_dst.add(8), 8);
+                }
+                *ip += 3;
+                *op += len;
+            }
+        }
+    }
 }
 
 #[inline(never)]
@@ -2432,28 +3053,22 @@ unsafe fn copy_match_38_overlap(src: *const u8, dst: *mut u8) {
 
 #[inline(always)]
 unsafe fn copy_offset1_repeat(dst: *mut u8, byte: u8, len: usize) {
-    let word = u64::from_ne_bytes([byte; 8]);
+    let wide = u128::from_ne_bytes([byte; 16]);
+    let word = wide as u64;
     unsafe {
-        if len >= 8 {
-            ptr::write_unaligned(dst.cast::<u64>(), word);
-            if len > 16 {
-                ptr::write_unaligned(dst.add(8).cast::<u64>(), word);
-            }
-            if len > 24 {
-                ptr::write_unaligned(dst.add(16).cast::<u64>(), word);
-            }
+        if len >= 16 {
+            ptr::write_unaligned(dst.cast::<u128>(), wide);
             if len > 32 {
-                ptr::write_unaligned(dst.add(24).cast::<u64>(), word);
-            }
-            if len > 40 {
-                ptr::write_unaligned(dst.add(32).cast::<u64>(), word);
+                ptr::write_unaligned(dst.add(16).cast::<u128>(), wide);
             }
             if len > 48 {
-                ptr::write_unaligned(dst.add(40).cast::<u64>(), word);
+                ptr::write_unaligned(dst.add(32).cast::<u128>(), wide);
             }
-            if len > 56 {
-                ptr::write_unaligned(dst.add(48).cast::<u64>(), word);
+            if len > 16 {
+                ptr::write_unaligned(dst.add(len - 16).cast::<u128>(), wide);
             }
+        } else if len >= 8 {
+            ptr::write_unaligned(dst.cast::<u64>(), word);
             if len > 8 {
                 ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), word);
             }
