@@ -1935,6 +1935,8 @@ unsafe fn copy_table_match_fast_cold(dst: *mut u8, offset: usize, len: usize) {
             ptr::copy_nonoverlapping(src, dst, len);
         } else if offset == 1 {
             copy_offset1_repeat(dst, *src, len);
+        } else if matches!(offset, 2 | 4) {
+            copy_match_short_word(src, dst, offset, len);
         } else {
             copy_table_match_fast_overlap(dst, offset, len);
         }
