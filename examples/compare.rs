@@ -3,8 +3,9 @@
 //!
 //! ```text
 //! SNAPPY_CPP_PREFIX=/path/to/snappy cargo run --release --example compare
-//! cargo run --release --example compare -- --filter txt --samples 30
-//! cargo run --release --example compare -- --only decode:snipsnap:data_html --iters 100
+//! cargo run --release --example compare -- --encode --filter txt --samples 30
+//! cargo run --release --example compare -- --only decode:snipsnap:html --iters 100
+//! SNAPPY_CPP_PREFIX=/path/to/snappy cargo run --release --example compare -- --identical
 //! ```
 //!
 //! Timings are the minimum over interleaved samples, so every implementation

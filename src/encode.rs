@@ -51,7 +51,7 @@ impl Encoder {
         }
         // SAFETY: the output length was checked and the table is zeroed and
         // large enough.
-        Ok(unsafe { compress_checked(input, output, &mut self.table) })
+        Ok(unsafe { compress_checked(input, output, &mut self.table, true) })
     }
 
     #[cold]
@@ -68,12 +68,16 @@ impl Encoder {
     }
 }
 
-/// One-shot compression, without allocating a hash table for small inputs.
+/// One-shot compression, without allocating a hash table for small inputs
+/// or clearing it after the last block.
 pub(crate) fn compress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
-    if input.len() > STACK_TABLE_SIZE {
-        return Encoder::new().compress(input, output);
-    }
     check_output_len(input.len(), output.len())?;
+    if input.len() > STACK_TABLE_SIZE {
+        let mut table = vec![0; table_size(input.len().min(BLOCK_SIZE))];
+        // SAFETY: the output length was checked and the table is zeroed and
+        // large enough.
+        return Ok(unsafe { compress_checked(input, output, &mut table, false) });
+    }
     // Only the part of the table this input uses is initialized.
     let mut table = [MaybeUninit::<u16>::uninit(); STACK_TABLE_SIZE];
     let table = &mut table[..table_size(input.len())];
@@ -82,7 +86,7 @@ pub(crate) fn compress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
     // length was checked.
     unsafe {
         let table = &mut *(table as *mut [MaybeUninit<u16>] as *mut [u16]);
-        Ok(compress_checked(input, output, table))
+        Ok(compress_checked(input, output, table, false))
     }
 }
 
@@ -118,19 +122,39 @@ fn table_size(block_len: usize) -> usize {
 /// `output` must have room for `max_compress_len(input.len())` bytes, which
 /// covers everything written including over-copies (see the module
 /// documentation). `table` must be zeroed and have at least
-/// `table_size(min(input.len(), BLOCK_SIZE))` entries; it is left zeroed.
+/// `table_size(min(input.len(), BLOCK_SIZE))` entries; it is left zeroed if
+/// `reuse` is set.
 #[inline(always)]
-unsafe fn compress_checked(input: &[u8], output: &mut [u8], table: &mut [u16]) -> usize {
+unsafe fn compress_checked(
+    input: &[u8],
+    output: &mut [u8],
+    table: &mut [u16],
+    reuse: bool,
+) -> usize {
     debug_assert!(output.len() >= max_compress_len(input.len()));
     let mut op = write_varint(output, input.len() as u32);
     // SAFETY: (for both branches) as documented above.
     unsafe {
         if input.len() <= BLOCK_SIZE {
-            op += compress_block_restoring(input, output.as_mut_ptr().add(op), table);
+            op += compress_block_restoring(
+                input,
+                output.as_mut_ptr().add(op),
+                table,
+                reuse,
+            );
         } else {
-            for block in input.chunks(BLOCK_SIZE) {
-                op += compress_block_restoring(block, output.as_mut_ptr().add(op), table);
+            let mut blocks = input.chunks(BLOCK_SIZE);
+            let last = blocks.next_back().unwrap();
+            for block in blocks {
+                op += compress_block_restoring(
+                    block,
+                    output.as_mut_ptr().add(op),
+                    table,
+                    true,
+                );
             }
+            op +=
+                compress_block_restoring(last, output.as_mut_ptr().add(op), table, reuse);
         }
     }
     debug_assert!(op <= output.len());
@@ -142,7 +166,8 @@ unsafe fn compress_checked(input: &[u8], output: &mut [u8], table: &mut [u16]) -
 /// past the input margin.
 const MIN_SEARCH_LEN: usize = INPUT_MARGIN + 2;
 
-/// Compresses one block to `op` and leaves `table` zeroed.
+/// Compresses one block to `op`, and leaves `table` zeroed if `restore` is
+/// set.
 ///
 /// # Safety
 ///
@@ -152,6 +177,7 @@ unsafe fn compress_block_restoring(
     block: &[u8],
     op: *mut u8,
     table: &mut [u16],
+    restore: bool,
 ) -> usize {
     if block.len() < MIN_SEARCH_LEN {
         if block.is_empty() {
@@ -165,6 +191,9 @@ unsafe fn compress_block_restoring(
     debug_assert!(table.iter().all(|&entry| entry == 0));
     // SAFETY: as documented above.
     let written = unsafe { compress_block(block, op, table) };
+    if !restore {
+        return written;
+    }
     // SAFETY: `compress_block` wrote at least one element.
     let copied = !unsafe { is_single_literal(op, block.len()) };
     // Leave the table zeroed for the next block (or input). Clearing a large

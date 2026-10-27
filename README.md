@@ -39,8 +39,28 @@ assert_eq!(decoded, input);
 # Ok::<(), snipsnap::Error>(())
 ```
 
+## Performance
+
+The raw compressor implements the C++ library's default algorithm and produces
+the same bytes, so it compresses exactly as well. `examples/compare.rs`
+compares both directions against the `snap` crate and, when built with
+`SNAPPY_CPP_PREFIX` pointing at an installed C++ snappy, against the C++
+library, on synthetic data, the standard Snappy test corpus, 4 KiB text pages
+and Parquet data pages.
+
+On an Intel Xeon (Cascade Lake, 2.8 GHz, one core), against `snap` 1.1.1 and
+C++ snappy 1.3.1 built with clang 18, geometric mean over 24 cases:
+
+| | snipsnap | `snap` | C++ |
+|---|---|---|---|
+| decompress | 5.5 GB/s | 3.2 GB/s | 3.9 GB/s |
+| compress | 2.5 GB/s | 2.0 GB/s | 2.2 GB/s |
+
+Individual cases move by 10–30% with code layout alone (for all three
+libraries), so compare best-of-several runs. C++ snappy is tuned for clang; a
+GCC build decompresses 2–3x slower.
+
 ## Status
 
-This is an initial `0.0.x` release. The raw decompressor is the most optimized
-part of the crate. The framed stream support is intentionally small and emits
-valid uncompressed frame chunks.
+This is an initial `0.0.x` release. The framed stream support is
+intentionally small and emits valid uncompressed frame chunks.

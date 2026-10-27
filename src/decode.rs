@@ -40,9 +40,13 @@ const INPUT_MARGIN: usize = (UNROLL - 1) * 61 + TAG_READ_SLOP + 4;
 const OUTPUT_MARGIN: usize = (UNROLL - 1) * 64 + TAG_WRITE_SLOP;
 
 /// Lookup tables for the fast loop, indexed by tag and kept together so that
-/// one base register addresses all of them.
+/// one base register addresses all of them. The byte table comes first: on
+/// aarch64 a load can add an index register or an offset to the base, not
+/// both, and the other two tables share the scaled index anyway.
 #[repr(C, align(64))]
 struct Tables {
+    /// Total encoded size of the element; only meaningful for fast-loop tags.
+    advance: [u8; 256],
     /// `len - (offset_high << 8)`, where `offset_high` is the part of a copy
     /// offset stored in the tag itself.
     ///
@@ -56,17 +60,15 @@ struct Tables {
     len_minus_offset: [isize; 256],
     /// Mask selecting the offset bytes that follow the tag.
     offset_mask: [usize; 256],
-    /// Total encoded size of the element; only meaningful for fast-loop tags.
-    advance: [u8; 256],
 }
 
 static TABLES: Tables = build_tables();
 
 const fn build_tables() -> Tables {
     let mut tables = Tables {
+        advance: [1; 256],
         len_minus_offset: [0; 256],
         offset_mask: [0; 256],
-        advance: [1; 256],
     };
     let mut tag = 0usize;
     while tag < 256 {
