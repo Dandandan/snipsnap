@@ -11,6 +11,7 @@ use std::slice;
 
 mod decode;
 mod encode;
+mod select;
 
 const MAX_BLOCK_LEN: u64 = u32::MAX as u64;
 const MAX_FRAME_BLOCK_LEN: usize = 1 << 16;

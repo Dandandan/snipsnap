@@ -15,8 +15,10 @@
 //! this leaves room for the 16-byte over-copies of short literals, which the
 //! main loop only performs while at least 15 input bytes remain.
 
+use std::mem::MaybeUninit;
 use std::ptr;
 
+use crate::select::select_if_zero;
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
 
 /// Input is compressed in independent blocks of this size.
@@ -59,8 +61,13 @@ impl Encoder {
 /// One-shot compression, without allocating a hash table for small inputs.
 pub(crate) fn compress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
     if input.len() <= STACK_TABLE_SIZE {
-        let mut table = [0u16; STACK_TABLE_SIZE];
-        compress_with_table(input, output, &mut table)
+        // Only the part of the table this input uses is initialized.
+        let mut table = [MaybeUninit::<u16>::uninit(); STACK_TABLE_SIZE];
+        let table = &mut table[..table_size(input.len())];
+        table.fill(MaybeUninit::new(0));
+        // SAFETY: every element of `table` was just initialized.
+        let table = unsafe { &mut *(table as *mut [MaybeUninit<u16>] as *mut [u16]) };
+        compress_with_table(input, output, table)
     } else {
         Encoder::new().compress(input, output)
     }
@@ -74,6 +81,8 @@ fn table_size(block_len: usize) -> usize {
         .next_power_of_two()
 }
 
+/// Compresses `input` using `table`, which must be zeroed and is left
+/// zeroed.
 fn compress_with_table(
     input: &[u8],
     output: &mut [u8],
@@ -96,15 +105,58 @@ fn compress_with_table(
     let mut op = write_varint(output, input.len() as u32);
     for block in input.chunks(BLOCK_SIZE) {
         let table = &mut table[..table_size(block.len())];
-        table.fill(0);
+        debug_assert!(table.iter().all(|&entry| entry == 0));
         debug_assert!(output.len() - op >= block.len() + 16);
         // SAFETY: `output` has room for `max_compress_len(input.len())`
         // bytes, which covers everything written for this and the following
         // blocks, including over-copies (see the module documentation).
-        op += unsafe { compress_block(block, output.as_mut_ptr().add(op), table) };
+        let (written, copied) =
+            unsafe { compress_block(block, output.as_mut_ptr().add(op), table) };
+        op += written;
         debug_assert!(op <= output.len());
+        // Leave the table zeroed for the next block (or input). Clearing all
+        // of it dominates the time spent on incompressible blocks, but a
+        // block without any copy only wrote entries for the positions its
+        // search probed, so those are cleared instead.
+        if copied {
+            table.fill(0);
+        } else {
+            clear_probed(block, table);
+        }
     }
     Ok(op)
+}
+
+/// Clears the table entries written for a block that was emitted as a
+/// single literal, by repeating the probe sequence of [`compress_block`]'s
+/// search for a first match.
+fn clear_probed(input: &[u8], table: &mut [u16]) {
+    let len = input.len();
+    if len < INPUT_MARGIN {
+        return;
+    }
+    let ip_limit = len - INPUT_MARGIN;
+    let mask = table.len() - 1;
+    let load = |pos: usize| u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
+    let mut ip = 1;
+    let mut skip = 32u32;
+    if ip + 16 <= ip_limit {
+        for i in 0..16 {
+            table[hash(load(ip + i), mask)] = 0;
+        }
+        ip += 16;
+        skip += 16;
+    }
+    loop {
+        let step = (skip >> 5) as usize;
+        skip += step as u32;
+        if ip + step > ip_limit {
+            break;
+        }
+        table[hash(load(ip), mask)] = 0;
+        ip += step;
+    }
+    debug_assert!(table.iter().all(|&entry| entry == 0));
 }
 
 fn write_varint(output: &mut [u8], mut value: u32) -> usize {
@@ -128,14 +180,19 @@ fn hash(bytes: u32, mask: usize) -> usize {
 }
 
 /// Compresses one block of at most `BLOCK_SIZE` bytes to `op`, returning
-/// the number of bytes written.
+/// the number of bytes written and whether any copy was emitted.
 ///
 /// # Safety
 ///
 /// `op` must be valid for writes of the block's worst-case compressed size
 /// plus the slack described in the module documentation, and `table` must
 /// be zeroed, a power of two in length and at most `MAX_TABLE_SIZE`.
-unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> usize {
+#[inline(never)]
+unsafe fn compress_block(
+    input: &[u8],
+    op_start: *mut u8,
+    table: &mut [u16],
+) -> (usize, bool) {
     debug_assert!(input.len() <= BLOCK_SIZE);
     debug_assert!(table.len().is_power_of_two() && table.len() <= MAX_TABLE_SIZE);
     let base = input.as_ptr();
@@ -147,6 +204,7 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
     // block, all of them before `ip`, so every candidate load below reads
     // initialized input.
     let mut ip = 0usize;
+    let mut copied = false;
 
     if len >= INPUT_MARGIN {
         let ip_limit = len - INPUT_MARGIN;
@@ -218,6 +276,7 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
 
                 // Step 3: emit copies for as long as the bytes after the last
                 // copy match again.
+                copied = true;
                 loop {
                     let start = ip;
                     let (extra, short) = find_match_length(
@@ -258,7 +317,7 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
         op = unsafe { emit_literal(op, base.add(ip), len - ip) };
     }
     // SAFETY: `op` was derived from `op_start`.
-    unsafe { op.offset_from(op_start) as usize }
+    (unsafe { op.offset_from(op_start) as usize }, copied)
 }
 
 /// Returns the number of bytes after the first four that match at `s1` and
@@ -447,13 +506,18 @@ unsafe fn emit_copy_at_most_64<const SHORT: bool>(
             // 2-byte-offset one. Which one is hard to predict, so both are
             // computed and one is selected.
             // The tag bytes are built with wrapping arithmetic, as the
-            // constants cancel the `len << 2` term's offset.
-            let mut u = (len << 2) + (offset << 8);
+            // constants cancel the `len << 2` term's offset. LLVM would
+            // otherwise turn the selects into a branch.
+            let far = (offset >> 11) as usize;
             let copy1 = 1u32.wrapping_sub(4 << 2).wrapping_add((offset >> 3) & 0xe0);
             let copy2 = 2u32.wrapping_sub(1 << 2);
-            u = u.wrapping_add(if offset < 2048 { copy1 } else { copy2 });
+            let u = ((len << 2) + (offset << 8)).wrapping_add(select_if_zero(
+                far,
+                copy1 as usize,
+                copy2 as usize,
+            ) as u32);
             write_u32(op, u);
-            op.add(if offset < 2048 { 2 } else { 3 })
+            op.add(select_if_zero(far, 2, 3))
         } else {
             write_u32(op, 2 + ((len - 1) << 2) + (offset << 8));
             op.add(3)
