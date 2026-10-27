@@ -261,6 +261,69 @@ fn short_inputs_roundtrip() {
     }
 }
 
+/// Incompressible blocks with a few planted matches, around the number of
+/// matches up to which the encoder clears its hash table entry by entry.
+#[test]
+fn few_matches_roundtrip() {
+    let mut rng = Rng(0x6a09_e667_f3bc_c908);
+    let mut encoder = snipsnap::raw::Encoder::new();
+    for matches in 0..scaled(40).max(36) {
+        for len in [
+            scaled(3000).max(200),
+            scaled(70_000).max(300),
+            scaled(140_000).max(400),
+        ] {
+            let mut data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            for _ in 0..matches {
+                let n = 4 + rng.below(60);
+                let from = rng.below(len - n);
+                let to = rng.below(len - n);
+                data.copy_within(from..from + n, to);
+            }
+            let ours = encoder.compress_vec(&data).unwrap();
+            assert_eq!(snap_decode(&ours).as_deref(), Some(&data[..]));
+            assert_eq!(snipsnap::compress(&data).unwrap(), ours);
+        }
+    }
+}
+
+/// Random bytes repeated with a random period for `len` bytes (one long
+/// match after the first period), then one byte that breaks the pattern and
+/// `tail` more bytes of it, so that another match follows right away.
+fn periodic(rng: &mut Rng, len: usize, tail: usize) -> Vec<u8> {
+    let pattern: Vec<u8> = (0..1 + rng.below(40)).map(|_| rng.next() as u8).collect();
+    let at = |i: usize| pattern[i % pattern.len()];
+    let mut data: Vec<u8> = (0..len).map(at).collect();
+    data.push(at(len) ^ 0x55);
+    data.extend((len + 1..len + 1 + tail).map(at));
+    data
+}
+
+/// Long matches ending at every position near the end of a block, and with
+/// every length around the one where the encoder's match search switches to
+/// 16-byte steps.
+#[test]
+fn long_matches_roundtrip() {
+    let mut rng = Rng(0xbb67_ae85_84ca_a73b);
+    let step = if cfg!(miri) { 7 } else { 1 };
+    for tail in 0..24 {
+        let mut inputs: Vec<Vec<u8>> = (1..200)
+            .step_by(step)
+            .map(|len| periodic(&mut rng, len, tail))
+            .collect();
+        if !cfg!(miri) {
+            // A match running to the end of the first block, or across it.
+            inputs.push(periodic(&mut rng, 65536 - tail, 0));
+            inputs.push(periodic(&mut rng, 65536 + tail, 20));
+        }
+        for data in inputs {
+            let ours = snipsnap::compress(&data).unwrap();
+            let len = data.len();
+            assert_eq!(snap_decode(&ours), Some(data), "len {len}, tail {tail}");
+        }
+    }
+}
+
 #[test]
 fn mutated_blocks_agree_with_snap() {
     let mut rng = Rng(0xdead_beef_cafe_f00d);

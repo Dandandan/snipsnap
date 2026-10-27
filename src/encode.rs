@@ -18,7 +18,7 @@
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use crate::select::select_if_zero;
+use crate::select::opaque;
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
 
 /// Input is compressed in independent blocks of this size.
@@ -42,12 +42,22 @@ impl Encoder {
         Self { table: Vec::new() }
     }
 
+    #[inline]
     pub(crate) fn compress(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
+        check_output_len(input.len(), output.len())?;
         let needed = table_size(input.len().min(BLOCK_SIZE));
         if self.table.len() < needed {
-            self.table = vec![0; needed];
+            self.grow_table(needed);
         }
-        compress_with_table(input, output, &mut self.table)
+        // SAFETY: the output length was checked and the table is zeroed and
+        // large enough.
+        Ok(unsafe { compress_checked(input, output, &mut self.table) })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_table(&mut self, len: usize) {
+        self.table = vec![0; len];
     }
 
     pub(crate) fn compress_vec(&mut self, input: &[u8]) -> Result<Vec<u8>> {
@@ -60,17 +70,37 @@ impl Encoder {
 
 /// One-shot compression, without allocating a hash table for small inputs.
 pub(crate) fn compress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
-    if input.len() <= STACK_TABLE_SIZE {
-        // Only the part of the table this input uses is initialized.
-        let mut table = [MaybeUninit::<u16>::uninit(); STACK_TABLE_SIZE];
-        let table = &mut table[..table_size(input.len())];
-        table.fill(MaybeUninit::new(0));
-        // SAFETY: every element of `table` was just initialized.
-        let table = unsafe { &mut *(table as *mut [MaybeUninit<u16>] as *mut [u16]) };
-        compress_with_table(input, output, table)
-    } else {
-        Encoder::new().compress(input, output)
+    if input.len() > STACK_TABLE_SIZE {
+        return Encoder::new().compress(input, output);
     }
+    check_output_len(input.len(), output.len())?;
+    // Only the part of the table this input uses is initialized.
+    let mut table = [MaybeUninit::<u16>::uninit(); STACK_TABLE_SIZE];
+    let table = &mut table[..table_size(input.len())];
+    table.fill(MaybeUninit::new(0));
+    // SAFETY: every element of `table` was just initialized, and the output
+    // length was checked.
+    unsafe {
+        let table = &mut *(table as *mut [MaybeUninit<u16>] as *mut [u16]);
+        Ok(compress_checked(input, output, table))
+    }
+}
+
+fn check_output_len(input_len: usize, output_len: usize) -> Result<()> {
+    let min_len = max_compress_len(input_len);
+    if min_len == 0 {
+        return Err(Error::TooBig {
+            given: input_len as u64,
+            max: MAX_BLOCK_LEN,
+        });
+    }
+    if output_len < min_len {
+        return Err(Error::OutputTooSmall {
+            given: output_len,
+            min: min_len,
+        });
+    }
+    Ok(())
 }
 
 /// Hash table size for a block: the input length rounded up to a power of
@@ -81,68 +111,121 @@ fn table_size(block_len: usize) -> usize {
         .next_power_of_two()
 }
 
-/// Compresses `input` using `table`, which must be zeroed and is left
-/// zeroed.
-fn compress_with_table(
-    input: &[u8],
-    output: &mut [u8],
-    table: &mut [u16],
-) -> Result<usize> {
-    let min_len = max_compress_len(input.len());
-    if min_len == 0 {
-        return Err(Error::TooBig {
-            given: input.len() as u64,
-            max: MAX_BLOCK_LEN,
-        });
-    }
-    if output.len() < min_len {
-        return Err(Error::OutputTooSmall {
-            given: output.len(),
-            min: min_len,
-        });
-    }
-
+/// Compresses `input` using `table`, returning the compressed length.
+///
+/// # Safety
+///
+/// `output` must have room for `max_compress_len(input.len())` bytes, which
+/// covers everything written including over-copies (see the module
+/// documentation). `table` must be zeroed and have at least
+/// `table_size(min(input.len(), BLOCK_SIZE))` entries; it is left zeroed.
+#[inline(always)]
+unsafe fn compress_checked(input: &[u8], output: &mut [u8], table: &mut [u16]) -> usize {
+    debug_assert!(output.len() >= max_compress_len(input.len()));
     let mut op = write_varint(output, input.len() as u32);
-    for block in input.chunks(BLOCK_SIZE) {
-        let table = &mut table[..table_size(block.len())];
-        debug_assert!(table.iter().all(|&entry| entry == 0));
-        debug_assert!(output.len() - op >= block.len() + 16);
-        // SAFETY: `output` has room for `max_compress_len(input.len())`
-        // bytes, which covers everything written for this and the following
-        // blocks, including over-copies (see the module documentation).
-        let (written, copied) =
-            unsafe { compress_block(block, output.as_mut_ptr().add(op), table) };
-        op += written;
-        debug_assert!(op <= output.len());
-        // Leave the table zeroed for the next block (or input). Clearing all
-        // of it dominates the time spent on incompressible blocks, but a
-        // block without any copy only wrote entries for the positions its
-        // search probed, so those are cleared instead.
-        if copied {
-            table.fill(0);
+    // SAFETY: (for both branches) as documented above.
+    unsafe {
+        if input.len() <= BLOCK_SIZE {
+            op += compress_block_restoring(input, output.as_mut_ptr().add(op), table);
         } else {
-            clear_probed(block, table);
+            for block in input.chunks(BLOCK_SIZE) {
+                op += compress_block_restoring(block, output.as_mut_ptr().add(op), table);
+            }
         }
     }
-    Ok(op)
+    debug_assert!(op <= output.len());
+    op
 }
 
-/// Clears the table entries written for a block that was emitted as a
-/// single literal, by repeating the probe sequence of [`compress_block`]'s
-/// search for a first match.
-fn clear_probed(input: &[u8], table: &mut [u16]) {
-    let len = input.len();
-    if len < INPUT_MARGIN {
-        return;
+/// Blocks shorter than this are emitted as one literal: the search for a
+/// match would not probe them anyway, as its first probe needs two bytes
+/// past the input margin.
+const MIN_SEARCH_LEN: usize = INPUT_MARGIN + 2;
+
+/// Compresses one block to `op` and leaves `table` zeroed.
+///
+/// # Safety
+///
+/// As for [`compress_block`], but `table` may be longer than needed.
+#[inline(always)]
+unsafe fn compress_block_restoring(
+    block: &[u8],
+    op: *mut u8,
+    table: &mut [u16],
+) -> usize {
+    if block.len() < MIN_SEARCH_LEN {
+        if block.is_empty() {
+            return 0;
+        }
+        // SAFETY: the bound covers a single literal.
+        return unsafe { emit_literal(op, block.as_ptr(), block.len()).offset_from(op) }
+            as usize;
     }
-    let ip_limit = len - INPUT_MARGIN;
-    let mask = table.len() - 1;
-    let load = |pos: usize| u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
-    let mut ip = 1;
+    let table = &mut table[..table_size(block.len())];
+    debug_assert!(table.iter().all(|&entry| entry == 0));
+    // SAFETY: as documented above.
+    let written = unsafe { compress_block(block, op, table) };
+    // SAFETY: `compress_block` wrote at least one element.
+    let copied = !unsafe { is_single_literal(op, block.len()) };
+    // Leave the table zeroed for the next block (or input). Clearing a large
+    // table dominates the time spent on incompressible blocks, but a block
+    // without any copy only wrote the entries its search probed, so those
+    // are cleared instead.
+    if copied || table.len() <= REPLAY_MIN_TABLE_SIZE {
+        table.fill(0);
+    } else {
+        clear_probed(block, table);
+    }
+    written
+}
+
+/// Whether the compressed block at `op` starts with a literal of all `len`
+/// bytes, which means that no copy was emitted: the first element of a block
+/// is always a literal, and if a copy follows it, it covers fewer bytes.
+///
+/// # Safety
+///
+/// `op` must be readable for 3 bytes.
+#[inline(always)]
+unsafe fn is_single_literal(op: *const u8, len: usize) -> bool {
+    debug_assert!((MIN_SEARCH_LEN..=BLOCK_SIZE).contains(&len));
+    let n = len - 1;
+    // SAFETY: as documented above.
+    let tag = unsafe { [*op, *op.add(1), *op.add(2)] };
+    if n < 60 {
+        tag[0] == (n << 2) as u8
+    } else if n < 256 {
+        tag[..2] == [60 << 2, n as u8]
+    } else {
+        tag == [61 << 2, n as u8, (n >> 8) as u8]
+    }
+}
+
+/// Tables up to this size are cleared in full; repeating the probes of a
+/// search costs more than that.
+const REPLAY_MIN_TABLE_SIZE: usize = 1 << 12;
+
+/// Clears the table entries written for a block that was emitted as a
+/// single literal, by repeating the probes of [`compress_block`]'s search
+/// for a match.
+fn clear_probed(input: &[u8], table: &mut [u16]) {
+    debug_assert!(input.len() >= MIN_SEARCH_LEN);
+    clear_search(input, table, 0, None);
+    debug_assert!(table.iter().all(|&entry| entry == 0));
+}
+
+/// Clears the entries probed by a search for a match that started after
+/// `next_emit` and found one at `found`, or ran out of input.
+fn clear_search(input: &[u8], table: &mut [u16], next_emit: usize, found: Option<usize>) {
+    let ip_limit = input.len() - INPUT_MARGIN;
+    let mut ip = next_emit + 1;
     let mut skip = 32u32;
     if ip + 16 <= ip_limit {
         for i in 0..16 {
-            table[hash(load(ip + i), mask)] = 0;
+            clear_entry(input, table, ip + i);
+            if found == Some(ip + i) {
+                return;
+            }
         }
         ip += 16;
         skip += 16;
@@ -151,12 +234,22 @@ fn clear_probed(input: &[u8], table: &mut [u16]) {
         let step = (skip >> 5) as usize;
         skip += step as u32;
         if ip + step > ip_limit {
-            break;
+            debug_assert!(found.is_none());
+            return;
         }
-        table[hash(load(ip), mask)] = 0;
+        clear_entry(input, table, ip);
+        if found == Some(ip) {
+            return;
+        }
         ip += step;
     }
-    debug_assert!(table.iter().all(|&entry| entry == 0));
+}
+
+#[inline(always)]
+fn clear_entry(input: &[u8], table: &mut [u16], pos: usize) {
+    let bytes = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
+    let mask = table.len() as u32 - 1;
+    table[hash(bytes, mask)] = 0;
 }
 
 fn write_varint(output: &mut [u8], mut value: u32) -> usize {
@@ -175,12 +268,12 @@ fn write_varint(output: &mut [u8], mut value: u32) -> usize {
 /// This is the C++ implementation's multiplicative hash; keeping it, and
 /// taking the same bits, keeps the output identical.
 #[inline(always)]
-fn hash(bytes: u32, mask: usize) -> usize {
-    (bytes.wrapping_mul(0x1e35_a7bd) >> (32 - MAX_TABLE_BITS)) as usize & mask
+fn hash(bytes: u32, mask: u32) -> usize {
+    ((bytes.wrapping_mul(0x1e35_a7bd) >> (32 - MAX_TABLE_BITS)) & mask) as usize
 }
 
 /// Compresses one block of at most `BLOCK_SIZE` bytes to `op`, returning
-/// the number of bytes written and whether any copy was emitted.
+/// the number of bytes written.
 ///
 /// # Safety
 ///
@@ -188,26 +281,25 @@ fn hash(bytes: u32, mask: usize) -> usize {
 /// plus the slack described in the module documentation, and `table` must
 /// be zeroed, a power of two in length and at most `MAX_TABLE_SIZE`.
 #[inline(never)]
-unsafe fn compress_block(
-    input: &[u8],
-    op_start: *mut u8,
-    table: &mut [u16],
-) -> (usize, bool) {
+unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> usize {
     debug_assert!(input.len() <= BLOCK_SIZE);
     debug_assert!(table.len().is_power_of_two() && table.len() <= MAX_TABLE_SIZE);
     let base = input.as_ptr();
     let len = input.len();
-    let mask = table.len() - 1;
+    let mask = table.len() as u32 - 1;
     let table = table.as_mut_ptr();
     let mut op = op_start;
     // `ip` is the current input position. Table entries are positions in the
     // block, all of them before `ip`, so every candidate load below reads
     // initialized input.
     let mut ip = 0usize;
-    let mut copied = false;
 
     if len >= INPUT_MARGIN {
+        // The search stops here. It is also the bound below which
+        // `find_match_length` compares 16 bytes at a time, so that one
+        // register serves both.
         let ip_limit = len - INPUT_MARGIN;
+        debug_assert!(len >= MIN_SEARCH_LEN);
         // SAFETY: (for the whole loop) all input reads are at most 16 bytes
         // past a position `<= ip_limit` or past an earlier match, so within
         // the block; table indexes are masked; output writes are covered by
@@ -276,13 +368,13 @@ unsafe fn compress_block(
 
                 // Step 3: emit copies for as long as the bytes after the last
                 // copy match again.
-                copied = true;
                 loop {
                     let start = ip;
                     let (extra, short) = find_match_length(
+                        base,
                         base.add(candidate + 4),
-                        base.add(ip + 4),
-                        base.add(len),
+                        ip + 4,
+                        ip_limit,
                         &mut data,
                     );
                     let matched = 4 + extra;
@@ -317,74 +409,105 @@ unsafe fn compress_block(
         op = unsafe { emit_literal(op, base.add(ip), len - ip) };
     }
     // SAFETY: `op` was derived from `op_start`.
-    (unsafe { op.offset_from(op_start) as usize }, copied)
+    unsafe { op.offset_from(op_start) as usize }
 }
 
 /// Returns the number of bytes after the first four that match at `s1` and
-/// `s2` (not reading at or past `s2_limit`) and whether that is fewer than
-/// eight. On return, the low five bytes of `data` are the input after the
-/// match, unless the match ran to within eight bytes of `s2_limit`.
+/// at position `s2` of the block at `base`, and whether that is fewer than
+/// eight. The match ends at the end of the block, `INPUT_MARGIN` bytes after
+/// `ip_limit`. On return, the low five bytes of `data` are the input after
+/// the match, unless the match ran to within eight bytes of the end.
 ///
 /// Computing `data` from the loads used for the comparison keeps the next
 /// hash lookup off the chain of loads that depend on the match length.
 ///
 /// # Safety
 ///
-/// `s1 < s2 <= s2_limit` within the same block.
+/// `s1` points into the block before `s2`, and `s2 <= ip_limit +
+/// INPUT_MARGIN`, the block length.
 #[inline(always)]
 unsafe fn find_match_length(
+    base: *const u8,
     s1: *const u8,
-    mut s2: *const u8,
-    s2_limit: *const u8,
+    s2: usize,
+    ip_limit: usize,
     data: &mut u64,
 ) -> (usize, bool) {
-    let mut matched = 0usize;
-    // SAFETY: (throughout) reads at `s2` are at most 16 bytes before
-    // `s2_limit` and reads at `s1` trail them by the match offset.
+    // 16 bytes can be read at `s2 + matched` while that is below `ip_limit`.
+    const _: () = assert!(INPUT_MARGIN == 15);
+    let mut matched = 0;
+    // SAFETY: (throughout) reads at `s2 + matched` stay within the block, as
+    // above, and reads at `s1 + matched` trail them by the match offset.
     unsafe {
-        if s2_limit.offset_from(s2) >= 16 {
+        if s2 < ip_limit {
             let a1 = read_u64(s1);
-            let a2 = read_u64(s2);
+            let a2 = read_u64(base.add(s2));
             if a1 != a2 {
                 let xor = a1 ^ a2;
                 let shift = xor.trailing_zeros();
-                let a3 = read_u64(s2.add(4));
+                let a3 = read_u64(base.add(s2 + 4));
                 let a2 = select_if_low_zero(xor, a3, a2);
                 *data = a2 >> (shift & 24);
                 return ((shift >> 3) as usize, true);
             }
+            // Longer matches. Hiding the counter from LLVM keeps it from
+            // rewriting the loops to use more than one.
+            let p2 = base.add(s2);
+            let limit = ip_limit - s2;
             matched = 8;
-            s2 = s2.add(8);
-        }
-        while s2_limit.offset_from(s2) >= 16 {
-            let a1 = read_u64(s1.add(matched));
-            let a2 = read_u64(s2);
-            if a1 == a2 {
-                s2 = s2.add(8);
-                matched += 8;
-            } else {
-                let xor = a1 ^ a2;
-                let shift = xor.trailing_zeros();
-                let a3 = read_u64(s2.add(4));
-                let a2 = select_if_low_zero(xor, a3, a2);
-                *data = a2 >> (shift & 24);
-                return (matched + (shift >> 3) as usize, false);
-            }
-        }
-        while s2 < s2_limit {
-            if *s1.add(matched) == *s2 {
-                s2 = s2.add(1);
-                matched += 1;
-            } else {
-                if s2_limit.offset_from(s2) >= 8 {
-                    *data = read_u64(s2);
+            let limit_8 = limit.min(LONG_MATCH);
+            while matched < limit_8 {
+                let a1 = read_u64(s1.add(matched));
+                let a2 = read_u64(p2.add(matched));
+                if a1 != a2 {
+                    let xor = a1 ^ a2;
+                    let shift = xor.trailing_zeros();
+                    let a3 = read_u64(p2.add(matched + 4));
+                    let a2 = select_if_low_zero(xor, a3, a2);
+                    *data = a2 >> (shift & 24);
+                    return (matched + (shift >> 3) as usize, false);
                 }
-                return (matched, matched < 8);
+                matched = opaque(matched + 8);
             }
+            // Long matches: 16 bytes at a time. Finding where such a match
+            // ends takes longer, but happens less often. The reads reach 23
+            // bytes past `p2 + matched`.
+            let limit_16 = limit.saturating_sub(7);
+            while matched < limit_16 {
+                if read_16(s1.add(matched)) != read_16(p2.add(matched)) {
+                    let low = read_u64(s1.add(matched)) ^ read_u64(p2.add(matched));
+                    let high =
+                        read_u64(s1.add(matched + 8)) ^ read_u64(p2.add(matched + 8));
+                    let bits = if low != 0 {
+                        low.trailing_zeros()
+                    } else {
+                        64 + high.trailing_zeros()
+                    };
+                    matched += (bits >> 3) as usize;
+                    *data = read_u64(p2.add(matched));
+                    return (matched, false);
+                }
+                matched = opaque(matched + 16);
+            }
+        }
+        let end = ip_limit + INPUT_MARGIN - s2;
+        let p2 = base.add(s2);
+        while matched < end {
+            if *s1.add(matched) != *p2.add(matched) {
+                if matched + 8 <= end {
+                    *data = read_u64(p2.add(matched));
+                }
+                break;
+            }
+            matched += 1;
         }
     }
     (matched, matched < 8)
 }
+
+/// Matches are compared 8 bytes at a time up to this length, and 16 at a
+/// time after it.
+const LONG_MATCH: usize = 64;
 
 /// Returns `if_zero` if the low 32 bits of `xor` are zero, else `otherwise`.
 ///
@@ -412,6 +535,41 @@ fn select_if_low_zero(xor: u64, if_zero: u64, otherwise: u64) -> u64 {
     {
         if xor as u32 == 0 { if_zero } else { otherwise }
     }
+}
+
+/// Returns `below` if `offset < 2048`, else `otherwise`, with a conditional
+/// move (see [`emit_copy_at_most_64`]).
+#[inline(always)]
+fn select_if_below_2048(offset: u32, below: u32, otherwise: u32) -> u32 {
+    let mut result = below;
+    // SAFETY: (for both) register-only instructions without memory access.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    unsafe {
+        std::arch::asm!(
+            "cmp {o:e}, 2048",
+            "cmovae {r:e}, {x:e}",
+            o = in(reg) offset,
+            x = in(reg) otherwise,
+            r = inout(reg) result,
+            options(pure, nomem, nostack),
+        );
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    unsafe {
+        std::arch::asm!(
+            "cmp {o:w}, #2048",
+            "csel {r:w}, {r:w}, {x:w}, lo",
+            o = in(reg) offset,
+            x = in(reg) otherwise,
+            r = inout(reg) result,
+            options(pure, nomem, nostack),
+        );
+    }
+    #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
+    if offset >= 2048 {
+        result = otherwise;
+    }
+    result
 }
 
 /// Emits a literal inside the main loop, where up to 15 bytes may be read
@@ -508,16 +666,12 @@ unsafe fn emit_copy_at_most_64<const SHORT: bool>(
             // The tag bytes are built with wrapping arithmetic, as the
             // constants cancel the `len << 2` term's offset. LLVM would
             // otherwise turn the selects into a branch.
-            let far = (offset >> 11) as usize;
             let copy1 = 1u32.wrapping_sub(4 << 2).wrapping_add((offset >> 3) & 0xe0);
             let copy2 = 2u32.wrapping_sub(1 << 2);
-            let u = ((len << 2) + (offset << 8)).wrapping_add(select_if_zero(
-                far,
-                copy1 as usize,
-                copy2 as usize,
-            ) as u32);
+            let u = ((len << 2) + (offset << 8))
+                .wrapping_add(select_if_below_2048(offset, copy1, copy2));
             write_u32(op, u);
-            op.add(select_if_zero(far, 2, 3))
+            op.add(2 + usize::from(offset >= 2048))
         } else {
             write_u32(op, 2 + ((len - 1) << 2) + (offset << 8));
             op.add(3)
@@ -565,6 +719,11 @@ unsafe fn read_u64(ptr: *const u8) -> u64 {
 #[inline(always)]
 unsafe fn write_u32(ptr: *mut u8, value: u32) {
     unsafe { ptr::write_unaligned(ptr.cast::<u32>(), value.to_le()) }
+}
+
+#[inline(always)]
+unsafe fn read_16(ptr: *const u8) -> [u8; 16] {
+    unsafe { ptr::read_unaligned(ptr.cast::<[u8; 16]>()) }
 }
 
 #[inline(always)]
