@@ -563,12 +563,31 @@ unsafe fn decode_run(
     }
     // Leave room for the overshoot of `fill_periodic`.
     let max_count = (dst_len - op).saturating_sub(MAX_RUN_PERIOD) / len;
-    let element = &src[ip..ip + size];
+    // Elements are compared as masked four-byte words, which compiles to a
+    // load and a compare rather than a call to `bcmp`, and exactly in the
+    // last bytes of the input.
+    let mask = if size == 2 { 0xffff } else { 0xff_ffff };
+    let word = |at: usize| {
+        src.get(at..at + 4).map(|bytes| {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & mask
+        })
+    };
+    let element = [src[ip], src[ip + 1], src.get(ip + 2).copied().unwrap_or(0)];
+    let element = &element[..size];
     let mut count = 1;
     let mut next = ip + size;
-    while count < max_count && src.get(next..next + size) == Some(element) {
-        count += 1;
-        next += size;
+    if let Some(value) = word(ip) {
+        while count < max_count {
+            match word(next) {
+                Some(next_value) if next_value == value => {}
+                Some(_) => break,
+                // Fewer than four bytes left.
+                None if src.get(next..next + size) == Some(element) => {}
+                None => break,
+            }
+            count += 1;
+            next += size;
+        }
     }
     if count < 2 {
         return None;
@@ -603,13 +622,7 @@ unsafe fn fill_periodic(start: *mut u8, offset: usize, total: usize) {
             (start.cast_const(), block, block)
         };
         while pos < total {
-            let to = start.add(pos);
-            let mut i = 0;
-            while i + 16 < block {
-                ptr::copy_nonoverlapping(source.add(i), to.add(i), 16);
-                i += 16;
-            }
-            ptr::copy_nonoverlapping(source.add(block - 16), to.add(block - 16), 16);
+            copy_16_to_128(source, start.add(pos), block);
             pos += block;
         }
     }
@@ -833,18 +846,34 @@ unsafe fn copy_short_pattern(dst: *mut u8, offset: usize, len: usize, op: usize)
     }
 }
 
+/// Copies exactly `len` bytes, `16 <= len <= 128`, between non-overlapping
+/// ranges, as two fixed-size copies that may overlap each other.
+///
+/// Written as a loop of 16-byte copies, this compiles to a call to `memcpy`.
+#[inline(always)]
+unsafe fn copy_16_to_128(from: *const u8, to: *mut u8, len: usize) {
+    debug_assert!((16..=128).contains(&len));
+    unsafe {
+        if len > 64 {
+            ptr::copy_nonoverlapping(from, to, 64);
+            ptr::copy_nonoverlapping(from.add(len - 64), to.add(len - 64), 64);
+        } else if len > 32 {
+            ptr::copy_nonoverlapping(from, to, 32);
+            ptr::copy_nonoverlapping(from.add(len - 32), to.add(len - 32), 32);
+        } else {
+            ptr::copy_nonoverlapping(from, to, 16);
+            ptr::copy_nonoverlapping(from.add(len - 16), to.add(len - 16), 16);
+        }
+    }
+}
+
 /// Copies exactly `len <= 64` bytes between non-overlapping ranges.
 #[inline(always)]
 unsafe fn copy_short_nonoverlapping(from: *const u8, to: *mut u8, len: usize) {
     debug_assert!(len <= 64);
     unsafe {
         if len >= 16 {
-            let mut i = 0;
-            while i + 16 < len {
-                ptr::copy_nonoverlapping(from.add(i), to.add(i), 16);
-                i += 16;
-            }
-            ptr::copy_nonoverlapping(from.add(len - 16), to.add(len - 16), 16);
+            copy_16_to_128(from, to, len);
         } else if len >= 8 {
             ptr::copy_nonoverlapping(from, to, 8);
             ptr::copy_nonoverlapping(from.add(len - 8), to.add(len - 8), 8);

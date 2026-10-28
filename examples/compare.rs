@@ -609,10 +609,20 @@ fn main() {
             }
             let batch = calib.max(1);
 
+            // Warm up every implementation, then rotate which one goes first
+            // in each round, so that none is always measured right after a
+            // switch (the clock of a shared machine moves with load).
+            for runner in &mut runners {
+                for _ in 0..batch {
+                    black_box(runner.run());
+                }
+            }
             let mut best_ns = vec![f64::MAX; imps.len()];
             let mut best_ticks = vec![f64::MAX; imps.len()];
-            for _ in 0..args.samples {
-                for (k, runner) in runners.iter_mut().enumerate() {
+            for sample in 0..args.samples {
+                for j in 0..imps.len() {
+                    let k = (sample + j) % imps.len();
+                    let runner = &mut runners[k];
                     let t0 = Instant::now();
                     let c0 = ticks();
                     for _ in 0..batch {
