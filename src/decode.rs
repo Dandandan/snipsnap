@@ -190,6 +190,16 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     let mut ip = 0usize;
     let mut op = 0usize;
 
+    if ip_limit_2 == 0 || op_limit_2 == 0 {
+        // The loops for the ends of the buffers only pay for the cost of
+        // entering them after the main one has run, so blocks too small for
+        // that are left to the careful path entirely.
+        while ip < src_len {
+            // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr` is valid
+            // for `dst_len` writes.
+            (ip, op) = unsafe { decode_one(src, ip, dst_ptr, dst_len, op)? };
+        }
+    }
     while ip < src_len {
         // SAFETY: (for all three calls) the limits leave the margins of the
         // respective loop after the starting positions.
