@@ -54,15 +54,22 @@ cases:
 
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
-| decompress | 8.1 GB/s | 3.9 GB/s | 5.2 GB/s |
+| decompress | 8.4 GB/s | 4.0 GB/s | 5.1 GB/s |
 | compress | 3.3 GB/s | 2.8 GB/s | 2.8 GB/s |
 
 C++ remains a few percent faster at decompressing plain text and HTML in
 large blocks; snipsnap is faster on small blocks and on data with long or
 repeated matches. On the Parquet pages (mostly under 100 bytes), it
-decompresses 2.1x as fast as `snap` and compresses 1.2x as fast. Individual cases move by 10–30% with code layout alone (for
-all three libraries), so compare best-of-several runs. C++ snappy is tuned
-for clang; a GCC build decompresses 2–3x slower.
+decompresses 2.5x as fast as `snap` and compresses 1.3x as fast.
+
+Decompressing all Snappy pages of a ClickBench partition (`hits_0.parquet`:
+728 pages, 378 MB decoded, mostly 1 MB pages of titles and URLs) runs at
+4.5 GB/s, 1.8x `snap` and 0.94x C++, which stays about 10% ahead on the URL
+columns.
+
+Individual cases move by 10–30% with code layout alone (for all three
+libraries), so compare best-of-several runs. C++ snappy is tuned for clang;
+a GCC build decompresses 2–3x slower.
 
 ## Status
 
