@@ -72,6 +72,11 @@ impl Encoder {
 /// or clearing it after the last block.
 pub(crate) fn compress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
     check_output_len(input.len(), output.len())?;
+    if input.len() < MIN_SEARCH_LEN {
+        // SAFETY: the output length was checked, and inputs this short are
+        // emitted as one literal without using the table.
+        return Ok(unsafe { compress_checked(input, output, &mut [], false) });
+    }
     if input.len() > STACK_TABLE_SIZE {
         let mut table = vec![0; table_size(input.len().min(BLOCK_SIZE))];
         // SAFETY: the output length was checked and the table is zeroed and
@@ -109,10 +114,13 @@ fn check_output_len(input_len: usize, output_len: usize) -> Result<()> {
 
 /// Hash table size for a block: the input length rounded up to a power of
 /// two, clamped to `MIN_TABLE_SIZE..=MAX_TABLE_SIZE`.
+#[inline(always)]
 fn table_size(block_len: usize) -> usize {
-    block_len
-        .clamp(MIN_TABLE_SIZE, MAX_TABLE_SIZE)
-        .next_power_of_two()
+    if block_len <= MIN_TABLE_SIZE {
+        MIN_TABLE_SIZE
+    } else {
+        block_len.min(MAX_TABLE_SIZE).next_power_of_two()
+    }
 }
 
 /// Compresses `input` using `table`, returning the compressed length.
@@ -122,8 +130,8 @@ fn table_size(block_len: usize) -> usize {
 /// `output` must have room for `max_compress_len(input.len())` bytes, which
 /// covers everything written including over-copies (see the module
 /// documentation). `table` must be zeroed and have at least
-/// `table_size(min(input.len(), BLOCK_SIZE))` entries; it is left zeroed if
-/// `reuse` is set.
+/// `table_size(min(input.len(), BLOCK_SIZE))` entries, unless the input is
+/// shorter than `MIN_SEARCH_LEN`; it is left zeroed if `reuse` is set.
 #[inline(always)]
 unsafe fn compress_checked(
     input: &[u8],
@@ -194,13 +202,14 @@ unsafe fn compress_block_restoring(
     if !restore {
         return written;
     }
-    // SAFETY: `compress_block` wrote at least one element.
-    let copied = !unsafe { is_single_literal(op, block.len()) };
     // Leave the table zeroed for the next block (or input). Clearing a large
     // table dominates the time spent on incompressible blocks, but a block
     // without any copy only wrote the entries its search probed, so those
     // are cleared instead.
-    if copied || table.len() <= REPLAY_MIN_TABLE_SIZE {
+    // SAFETY: `compress_block` wrote at least one element.
+    if table.len() <= REPLAY_MIN_TABLE_SIZE
+        || !unsafe { is_single_literal(op, block.len()) }
+    {
         table.fill(0);
     } else {
         clear_probed(block, table);
@@ -452,8 +461,8 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
 ///
 /// # Safety
 ///
-/// `s1` points into the block before `s2`, and `s2 <= ip_limit +
-/// INPUT_MARGIN`, the block length.
+/// `s1` points into the block before `s2`, and `s2 <= ip_limit + 4`: the
+/// match starts at or before `ip_limit`.
 #[inline(always)]
 unsafe fn find_match_length(
     base: *const u8,
@@ -519,16 +528,35 @@ unsafe fn find_match_length(
                 matched = opaque(matched + 16);
             }
         }
+        // The last bytes of the block, which often all match in small
+        // blocks: 8 at a time, then the rest in one comparison of the eight
+        // bytes that end at the block end. Those are in bounds at `s1` too:
+        // the match starts at or before `ip_limit`, so its offset is less
+        // than the block length less `INPUT_MARGIN`.
         let end = ip_limit + INPUT_MARGIN - s2;
         let p2 = base.add(s2);
-        while matched < end {
-            if *s1.add(matched) != *p2.add(matched) {
+        while matched + 8 <= end {
+            let xor = read_u64(s1.add(matched)) ^ read_u64(p2.add(matched));
+            if xor != 0 {
+                matched += (xor.trailing_zeros() >> 3) as usize;
                 if matched + 8 <= end {
                     *data = read_u64(p2.add(matched));
                 }
-                break;
+                return (matched, matched < 8);
             }
-            matched += 1;
+            matched += 8;
+        }
+        let rest = end - matched;
+        if rest > 0 {
+            debug_assert!(s1.addr() - base.addr() + end >= 8);
+            let xor = read_u64(s1.add(end).sub(8)) ^ read_u64(p2.add(end).sub(8));
+            // Only the high `rest` bytes are still to compare.
+            let xor = xor >> (64 - 8 * rest);
+            matched += if xor == 0 {
+                rest
+            } else {
+                (xor.trailing_zeros() >> 3) as usize
+            };
         }
     }
     (matched, matched < 8)
@@ -644,8 +672,46 @@ unsafe fn emit_literal_fast(op: *mut u8, literal: *const u8, len: usize) -> *mut
 unsafe fn emit_literal(op: *mut u8, literal: *const u8, len: usize) -> *mut u8 {
     unsafe {
         let op = emit_literal_tag(op, len);
-        ptr::copy_nonoverlapping(literal, op, len);
+        copy_exact(literal, op, len);
         op.add(len)
+    }
+}
+
+/// Copies `len` bytes: up to 64 inline, as fixed-size copies that may
+/// overlap each other, and more with `memcpy`. Small blocks often end in a
+/// short literal, where a call would cost more than the copy.
+///
+/// # Safety
+///
+/// As for [`ptr::copy_nonoverlapping`].
+#[inline(always)]
+unsafe fn copy_exact(from: *const u8, to: *mut u8, len: usize) {
+    unsafe {
+        if len > 64 {
+            ptr::copy_nonoverlapping(from, to, len);
+        } else if len > 32 {
+            copy_16(from, to);
+            copy_16(from.add(16), to.add(16));
+            copy_16(from.add(len - 32), to.add(len - 32));
+            copy_16(from.add(len - 16), to.add(len - 16));
+        } else if len >= 16 {
+            copy_16(from, to);
+            copy_16(from.add(len - 16), to.add(len - 16));
+        } else if len >= 8 {
+            let (head, tail) = (read_u64(from), read_u64(from.add(len - 8)));
+            write_u64(to, head);
+            write_u64(to.add(len - 8), tail);
+        } else if len >= 4 {
+            let (head, tail) = (read_u32(from), read_u32(from.add(len - 4)));
+            write_u32(to, head);
+            write_u32(to.add(len - 4), tail);
+        } else if len > 0 {
+            // Bytes 0, `len / 2` and `len - 1` cover lengths 1 to 3.
+            let (a, b, c) = (*from, *from.add(len / 2), *from.add(len - 1));
+            *to = a;
+            *to.add(len / 2) = b;
+            *to.add(len - 1) = c;
+        }
     }
 }
 
@@ -748,6 +814,11 @@ unsafe fn read_u64(ptr: *const u8) -> u64 {
 #[inline(always)]
 unsafe fn write_u32(ptr: *mut u8, value: u32) {
     unsafe { ptr::write_unaligned(ptr.cast::<u32>(), value.to_le()) }
+}
+
+#[inline(always)]
+unsafe fn write_u64(ptr: *mut u8, value: u64) {
+    unsafe { ptr::write_unaligned(ptr.cast::<u64>(), value.to_le()) }
 }
 
 #[inline(always)]

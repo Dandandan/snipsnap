@@ -324,6 +324,44 @@ fn long_matches_roundtrip() {
     }
 }
 
+/// Copies in blocks small enough for the careful path: every offset below
+/// 64 with every length up to 64, right after a literal of `offset` bytes
+/// (so that short patterns start fewer than eight bytes into the output) or
+/// a longer one, and followed by a few more bytes or none.
+#[test]
+fn small_block_copies_match_snap() {
+    let mut rng = Rng(0x3c6e_f372_fe94_f82b);
+    let step = if cfg!(miri) { 5 } else { 1 };
+    for offset in (1..64).step_by(step) {
+        for len in (1..=64).step_by(step) {
+            for prefix in [0, 3, 9] {
+                let mut expected: Vec<u8> =
+                    (0..offset + prefix).map(|_| rng.next() as u8).collect();
+                let mut body = Vec::new();
+                literal(&expected, &mut body);
+                copy(&mut rng, len, offset, &mut body);
+                for _ in 0..len {
+                    expected.push(expected[expected.len() - offset]);
+                }
+                let tail: Vec<u8> = (0..rng.below(9)).map(|_| rng.next() as u8).collect();
+                if !tail.is_empty() {
+                    literal(&tail, &mut body);
+                    expected.extend_from_slice(&tail);
+                }
+                let mut block = Vec::new();
+                header(expected.len(), &mut block);
+                block.extend_from_slice(&body);
+                assert_eq!(
+                    snipsnap::decompress(&block).ok(),
+                    Some(expected),
+                    "offset {offset}, len {len}, prefix {prefix}"
+                );
+                check(&block);
+            }
+        }
+    }
+}
+
 #[test]
 fn mutated_blocks_agree_with_snap() {
     let mut rng = Rng(0xdead_beef_cafe_f00d);

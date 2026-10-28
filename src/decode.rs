@@ -130,15 +130,42 @@ pub(crate) fn decode_body(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()>
         // SAFETY: `literal` and `dst` both have `dst_len` bytes and cannot
         // overlap, as `dst` is exclusively borrowed.
         unsafe {
-            ptr::copy_nonoverlapping(
-                literal.as_ptr(),
-                dst.as_mut_ptr().cast::<u8>(),
-                dst_len,
-            );
+            let (from, to) = (literal.as_ptr(), dst.as_mut_ptr().cast::<u8>());
+            if dst_len <= 64 {
+                copy_short_nonoverlapping(from, to, dst_len);
+            } else {
+                ptr::copy_nonoverlapping(from, to, dst_len);
+            }
         }
         return Ok(());
     }
+    if src.len() <= input_margin(2, true) || dst_len <= output_margin(2, true) {
+        // The loops for the ends of the buffers only pay for the cost of
+        // entering them after the main one has run, so blocks too small for
+        // that are left to the careful path entirely.
+        return decode_careful(src, dst);
+    }
     decode_in_place(src, dst)
+}
+
+/// Decodes with the careful path only.
+#[inline(never)]
+fn decode_careful(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
+    let dst_len = dst.len();
+    let dst_ptr = dst.as_mut_ptr().cast::<u8>();
+    let (mut ip, mut op) = (0, 0);
+    while ip < src.len() {
+        // SAFETY: `ip < src.len()`, `op <= dst_len` and `dst_ptr` is valid
+        // for `dst_len` writes.
+        (ip, op) = unsafe { decode_one(src, ip, dst_ptr, dst_len, op)? };
+    }
+    if op != dst_len {
+        return decode_error(Error::HeaderMismatch {
+            expected: dst_len,
+            actual: op,
+        });
+    }
+    Ok(())
 }
 
 /// Returns the payload if `src` is exactly one literal of `dst_len` bytes.
@@ -189,17 +216,6 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     let (ip_limit_n, op_limit_n) = limits(1, false);
     let mut ip = 0usize;
     let mut op = 0usize;
-
-    if ip_limit_2 == 0 || op_limit_2 == 0 {
-        // The loops for the ends of the buffers only pay for the cost of
-        // entering them after the main one has run, so blocks too small for
-        // that are left to the careful path entirely.
-        while ip < src_len {
-            // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr` is valid
-            // for `dst_len` writes.
-            (ip, op) = unsafe { decode_one(src, ip, dst_ptr, dst_len, op)? };
-        }
-    }
     while ip < src_len {
         // SAFETY: (for all three calls) the limits leave the margins of the
         // respective loop after the starting positions.
@@ -787,12 +803,19 @@ unsafe fn copy_match(
             }
         } else if offset < 8 {
             copy_short_pattern(to, offset, len, op);
+        } else if offset == 8 {
+            fill_period_8(to, read_u64_le(from), offset, len);
         } else if dst_remaining >= TAG_WRITE_SLOP {
             copy_overlapping(to, to, offset, len);
         } else {
-            for i in 0..len {
-                *to.add(i) = *from.add(i);
+            // Exactly: whole periods, then part of one, each copied from
+            // the `offset > 8` bytes before `to`, which are not written.
+            let mut i = 0;
+            while len - i > offset {
+                copy_short_nonoverlapping(from, to.add(i), offset);
+                i += offset;
             }
+            copy_short_nonoverlapping(from, to.add(i), len - i);
         }
     }
 }
@@ -811,13 +834,23 @@ unsafe fn copy_short_pattern(dst: *mut u8, offset: usize, len: usize, op: usize)
         let seed = if op >= 8 {
             read_u64_le(dst.sub(8)) >> (8 * (8 - offset))
         } else {
-            let mut seed = 0u64;
-            for i in 0..offset {
-                seed |= u64::from(*dst.sub(offset).add(i)) << (8 * i);
+            // Only the `offset` bytes before `dst` are initialized: read
+            // them in two pieces that may overlap.
+            let from = dst.sub(offset);
+            if offset >= 4 {
+                u64::from(read_u32_le(from))
+                    | u64::from(read_u32_le(dst.sub(4))) << (8 * (offset - 4))
+            } else {
+                u64::from(*from)
+                    | u64::from(*from.add(offset / 2)) << (8 * (offset / 2))
+                    | u64::from(*from.add(offset - 1)) << (8 * (offset - 1))
             }
-            seed
         };
         let pattern = seed.wrapping_mul(REPEAT_MUL[offset]);
+        if offset.is_power_of_two() {
+            fill_period_8(dst, pattern, offset, len);
+            return;
+        }
         let stride = REPEAT_STRIDE[offset];
         let mut i = 0;
         while i + 8 <= len {
@@ -842,6 +875,55 @@ unsafe fn copy_short_pattern(dst: *mut u8, offset: usize, len: usize, op: usize)
             );
         } else if tail == 1 {
             *to = pattern as u8;
+        }
+    }
+}
+
+/// Writes exactly `len` bytes at `dst` repeating `pattern`, eight bytes with
+/// a period of `offset`, which divides 8, from the pattern's first byte.
+///
+/// Any eight bytes that start a whole number of periods in hold `pattern`,
+/// and those that end at `len` hold it rotated by `len % offset` bytes, so
+/// a few stores that may overlap write it without a loop.
+///
+/// # Safety
+///
+/// `offset` is 1, 2, 4 or 8, `offset < len <= 64`, and `dst[..len]` must be
+/// valid for writes.
+#[inline(always)]
+unsafe fn fill_period_8(dst: *mut u8, pattern: u64, offset: usize, len: usize) {
+    debug_assert!(offset.is_power_of_two() && offset <= 8 && offset < len && len <= 64);
+    let end = pattern.rotate_right(8 * (len & (offset - 1)) as u32);
+    let pair = |word: u64| {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&word.to_le_bytes());
+        bytes[8..].copy_from_slice(&word.to_le_bytes());
+        bytes
+    };
+    unsafe {
+        if len >= 16 {
+            let (head, end) = (pair(pattern), pair(end));
+            write_16(dst, head);
+            if len > 32 {
+                write_16(dst.add(16), head);
+                write_16(dst.add(len - 32), end);
+            }
+            write_16(dst.add(len - 16), end);
+        } else if len >= 8 {
+            write_u64_le(dst, pattern);
+            write_u64_le(dst.add(len - 8), end);
+        } else if len >= 4 {
+            ptr::write_unaligned(dst.cast::<u32>(), (pattern as u32).to_le());
+            ptr::write_unaligned(
+                dst.add(len - 4).cast::<u32>(),
+                ((end >> 32) as u32).to_le(),
+            );
+        } else {
+            ptr::write_unaligned(dst.cast::<u16>(), (pattern as u16).to_le());
+            ptr::write_unaligned(
+                dst.add(len - 2).cast::<u16>(),
+                ((end >> 48) as u16).to_le(),
+            );
         }
     }
 }

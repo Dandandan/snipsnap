@@ -172,7 +172,7 @@ pub fn decompress(src: &[u8]) -> Result<Vec<u8>> {
 /// [`decompress_len`] bytes long.
 #[inline]
 pub fn decompress_into<'a>(src: &[u8], dst: &'a mut [u8]) -> Result<&'a mut [u8]> {
-    let len = decompress_len(src)?;
+    let (len, header_len) = read_header(src)?;
     if dst.len() < len {
         return Err(Error::OutputTooSmall {
             given: dst.len(),
@@ -180,10 +180,13 @@ pub fn decompress_into<'a>(src: &[u8], dst: &'a mut [u8]) -> Result<&'a mut [u8]
         });
     }
     let dst = &mut dst[..len];
-    let dst = unsafe {
+    // SAFETY: the decoder copies only bytes from `src`, from `dst` itself and
+    // from initialized statics, so `dst` stays initialized.
+    let uninit = unsafe {
         slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<u8>>(), len)
     };
-    decompress_into_uninit(src, dst)
+    decode::decode_body(&src[header_len..], uninit)?;
+    Ok(dst)
 }
 
 /// Decompresses a raw Snappy block into `dst` without requiring zeroed output.
@@ -274,6 +277,7 @@ pub mod raw {
         }
 
         /// Compresses `input` into `output`.
+        #[inline]
         pub fn compress(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
             self.inner.compress(input, output)
         }
