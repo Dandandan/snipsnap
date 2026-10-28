@@ -302,7 +302,9 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     };
     let mut tag = usize::from(unsafe { *ip.sub(1) });
     let tables = &TABLES;
-    let mut stop = Stop::Tag;
+    // The rare exits from the middle of a step set their reason, so that
+    // the loop's own exit, the common one, needs no instruction for it.
+    let mut stop = Stop::Limit;
     // Each element's copy is deferred to the next step: `pending_len` bytes
     // from `pending_from` go to `out`, and the element being decoded starts
     // after them. Doing the copy (and its rarely taken branch for more than
@@ -370,13 +372,18 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             let match_from = element_out
                 .cast_const()
                 .wrapping_offset(len_minus_offset - len as isize);
-            if !WIDE && (len > FAST_COPY || len_minus_offset > 0) {
+            // `len_minus_offset > 0`, compared this way so that the branch
+            // can use the flags of the comparison.
+            let overlaps = entry > trailer as isize;
+            if !WIDE && (len > FAST_COPY || overlaps) {
+                stop = Stop::Tag;
                 break $exit;
             }
-            if len_minus_offset > 0 {
+            if overlaps {
                 cold();
                 if len & 0x80 != 0 {
                     // Long literal or 4-byte offset copy.
+                    stop = Stop::Tag;
                     break $exit;
                 }
                 // Overlapping copy, or a copy with offset zero.
@@ -384,6 +391,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                 // SAFETY: `element_out` was derived from `dst`.
                 let op = unsafe { element_out.offset_from(dst) } as usize;
                 if offset == 0 || offset > op || (offset < 8 && op < 8) {
+                    stop = Stop::Tag;
                     break $exit;
                 }
                 // SAFETY: the next element is within the input margin.
@@ -416,6 +424,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                 if (match_from as usize) < (dst as usize) {
                     cold();
                     if tag_type != 0 {
+                        stop = Stop::Tag;
                         break $exit;
                     }
                 }
@@ -431,10 +440,14 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                         // the two start a run of identical copies, as found
                         // in data with periods of 64 to `MAX_RUN_PERIOD`
                         // bytes; see `decode_run`, which takes over at the
-                        // pending element.
-                        if tag == 0xfe
+                        // pending element. The period is tested first: most
+                        // long copies in text-like data, such as ClickBench's
+                        // titles and URLs, are 64-byte copies one after the
+                        // other at longer periods, where testing the tag
+                        // first measured slower.
+                        if out.addr().wrapping_sub(pending_from.addr()) <= MAX_RUN_PERIOD
+                            && tag == 0xfe
                             && pending_len == 64
-                            && out.addr() - pending_from.addr() <= MAX_RUN_PERIOD
                             && next_is_same(ip.sub(3), ip, 2)
                         {
                             stop = Stop::Run;
@@ -466,7 +479,6 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
         }
         // SAFETY: as for `element_out`.
         if ip >= ip_limit || unsafe { out.add(pending_len) } >= out_limit {
-            stop = Stop::Limit;
             break;
         }
     }
