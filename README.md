@@ -48,17 +48,20 @@ compares both directions against the `snap` crate and, when built with
 library, on synthetic data, the standard Snappy test corpus, 4 KiB text pages
 and Parquet data pages.
 
-On an Intel Xeon (Cascade Lake, 2.8 GHz, one core), against `snap` 1.1.1 and
-C++ snappy 1.3.1 built with clang 18, geometric mean over 24 cases:
+On one core of an Intel Xeon (Sapphire Rapids class, 2.1 GHz base), against
+`snap` 1.1.1 and C++ snappy 1.3.1 built with clang 18, geometric mean over 24
+cases:
 
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
-| decompress | 5.5 GB/s | 3.2 GB/s | 3.9 GB/s |
-| compress | 2.5 GB/s | 2.0 GB/s | 2.2 GB/s |
+| decompress | 7.2 GB/s | 3.7 GB/s | 4.7 GB/s |
+| compress | 2.9 GB/s | 2.5 GB/s | 2.5 GB/s |
 
-Individual cases move by 10–30% with code layout alone (for all three
-libraries), so compare best-of-several runs. C++ snappy is tuned for clang; a
-GCC build decompresses 2–3x slower.
+C++ remains a few percent faster at decompressing plain text and HTML in
+large blocks; snipsnap is faster on small blocks and on data with long or
+repeated matches. Individual cases move by 10–30% with code layout alone (for
+all three libraries), so compare best-of-several runs. C++ snappy is tuned
+for clang; a GCC build decompresses 2–3x slower.
 
 ## Status
 
