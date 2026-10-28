@@ -61,17 +61,6 @@ const fn output_margin(unroll: usize, wide: bool) -> usize {
     }
 }
 
-/// Why [`decode_fast`] returned.
-#[derive(Clone, Copy)]
-enum Stop {
-    /// It reached one of its limits.
-    Limit,
-    /// The next tag needs the careful path.
-    Tag,
-    /// The next tag starts a run of identical copies (see [`decode_run`]).
-    Run,
-}
-
 /// Lookup tables for the fast loop, indexed by tag and kept together so that
 /// one base register addresses both. The byte table comes first: on aarch64 a
 /// load can add an index register or an offset to the base, not both.
@@ -90,11 +79,14 @@ struct Tables {
     /// looks like an overlapping copy and is then recognized by the high bit
     /// of its length.
     len_minus_offset: [i16; 256],
+    /// [`OFFSET_MASK`], here so that on x86-64 the same base register
+    /// addresses it, rather than an address recomputed for every tag.
+    offset_mask: [u32; 4],
 }
 
-/// Mask selecting the offset bytes that follow a tag, by tag type. Kept apart
-/// from (and smaller than) a per-tag table, as in the C++ library, which
-/// measured slightly faster.
+/// Mask selecting the offset bytes that follow a tag, by tag type. aarch64
+/// uses this copy, whose address stays in a register: one in [`Tables`]
+/// would need an instruction to add its offset.
 static OFFSET_MASK: [u32; 4] = [0, 0xff, 0xffff, 0];
 
 static TABLES: Tables = build_tables();
@@ -103,6 +95,7 @@ const fn build_tables() -> Tables {
     let mut tables = Tables {
         advance: [1; 256],
         len_minus_offset: [0; 256],
+        offset_mask: OFFSET_MASK,
     };
     let mut tag = 0usize;
     while tag < 256 {
@@ -229,35 +222,38 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     while ip < src_len {
         // SAFETY: (for all three calls) the limits leave the margins of the
         // respective loop after the starting positions.
-        let (next_ip, next_op, stop) = if ip < ip_limit_2 && op < op_limit_2 {
-            unsafe {
+        let (ip_limit, op_limit) = if ip < ip_limit_2 && op < op_limit_2 {
+            (ip, op) = unsafe {
                 decode_fast::<2, true>(src_ptr, ip, ip_limit_2, dst_ptr, op, op_limit_2)
-            }
+            };
+            (ip_limit_2, op_limit_2)
         } else if ip < ip_limit_1 && op < op_limit_1 {
-            unsafe {
+            (ip, op) = unsafe {
                 decode_fast::<1, true>(src_ptr, ip, ip_limit_1, dst_ptr, op, op_limit_1)
-            }
+            };
+            (ip_limit_1, op_limit_1)
         } else if ip < ip_limit_n && op < op_limit_n {
-            unsafe {
+            (ip, op) = unsafe {
                 decode_fast::<1, false>(src_ptr, ip, ip_limit_n, dst_ptr, op, op_limit_n)
-            }
+            };
+            (ip_limit_n, op_limit_n)
         } else {
             // `ip` and `op` only grow, and the narrow loop has the largest
             // limits, so none of the loops applies again.
             break;
         };
-        (ip, op) = (next_ip, next_op);
-        match stop {
-            Stop::Limit => continue,
-            Stop::Tag => {}
-            Stop::Run => {
-                // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr` is
-                // valid for `dst_len` writes.
-                if let Some(next) = unsafe { decode_run(src, ip, dst_ptr, dst_len, op) } {
-                    (ip, op) = next;
-                    continue;
-                }
-            }
+        if ip >= ip_limit || op >= op_limit {
+            // The loop reached its limits (or stopped at a tag past them,
+            // which the next loop or the careful path decodes).
+            continue;
+        }
+        // The loop stopped at a tag it does not decode, which may start a
+        // run of identical copies.
+        // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr` is valid for
+        // `dst_len` writes.
+        if let Some(next) = unsafe { decode_run(src, ip, dst_ptr, dst_len, op) } {
+            (ip, op) = next;
+            continue;
         }
         // SAFETY: as for `decode_run`.
         (ip, op) = unsafe { decode_one(src, ip, dst_ptr, dst_len, op)? };
@@ -288,7 +284,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     dst: *mut u8,
     op: usize,
     op_limit: usize,
-) -> (usize, usize, Stop) {
+) -> (usize, usize) {
     const { assert!(UNROLL == 1 || (UNROLL == 2 && WIDE)) };
     debug_assert!(ip < ip_limit && op < op_limit);
     // SAFETY: `ip < ip_limit` and `op < op_limit`, so all four are in bounds.
@@ -304,9 +300,11 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     };
     let mut tag = usize::from(unsafe { *ip.sub(1) });
     let tables = &TABLES;
-    // The rare exits from the middle of a step set their reason, so that
-    // the loop's own exit, the common one, needs no instruction for it.
-    let mut stop = Stop::Limit;
+    let offset_mask = if cfg!(target_arch = "x86_64") {
+        &tables.offset_mask
+    } else {
+        &OFFSET_MASK
+    };
     // Each element's copy is deferred to the next step: `pending_len` bytes
     // from `pending_from` go to `out`, and the element being decoded starts
     // after them. Doing the copy (and its rarely taken branch for more than
@@ -322,35 +320,21 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     macro_rules! step {
         ($exit:lifetime) => {{
             debug_assert!(tag < 256);
-            let tag_type = tag & 3;
+            // SAFETY: both candidates for the next tag are within
+            // `TAG_READ_SLOP` of the tag, and in the narrow loop within
+            // `FAST_COPY + 2`: longer literals are left to the careful path,
+            // so their next tag is not needed.
+            let (tag_type, next_tag) = unsafe { next_tag::<WIDE>(ip, tag) };
 
-            // Load both candidates for the next tag before selecting, which
-            // keeps the select off the load-to-load dependency chain. The
-            // volatile reads stop LLVM from turning this into one load from
-            // a selected address.
-            // SAFETY: both are within `TAG_READ_SLOP` of the tag, and in the
-            // narrow loop within `FAST_COPY + 2`: longer literals are left
-            // to the careful path, so their next tag is not needed.
-            let literal_len = if WIDE {
-                (tag >> 2) + 1
-            } else {
-                ((tag >> 2) + 1).min(FAST_COPY + 1)
-            };
-            let next_literal =
-                usize::from(unsafe { ptr::read_volatile(ip.add(literal_len)) });
-            let next_copy = usize::from(unsafe { ptr::read_volatile(ip.add(tag_type)) });
-            let next_tag = select_if_zero(tag_type, next_literal, next_copy);
-
-            // SAFETY: `tag` is a byte (`select_if_zero` hides that from
-            // LLVM), and the reads are within `TAG_READ_SLOP` of the tag. The
-            // advance is only used once the tag is known to be a fast-loop
-            // tag. The narrow loop's margin does not cover the advance of a
+            // SAFETY: `tag` is a byte (`next_tag` hides that from LLVM), and
+            // the reads are within `TAG_READ_SLOP` of the tag. The advance is
+            // only used once the tag is known to be a fast-loop tag. The narrow loop's margin does not cover the advance of a
             // literal it leaves to the careful path, hence the wrapping add.
             let (entry, trailer, next_ip) = unsafe {
                 let advance = usize::from(*tables.advance.get_unchecked(tag));
                 (
                     isize::from(*tables.len_minus_offset.get_unchecked(tag)),
-                    (read_u32(ip) & *OFFSET_MASK.get_unchecked(tag_type)) as usize,
+                    (read_u32(ip) & *offset_mask.get_unchecked(tag_type)) as usize,
                     if WIDE {
                         ip.add(advance)
                     } else {
@@ -362,7 +346,9 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             // on the cold path, which costs a register copy per tag.
             let len = opaque((entry & 0xff) as usize);
             // `entry` is in `-1792..=255` and `trailer` in `0..=0xffff`.
-            let len_minus_offset = entry - trailer as isize;
+            // `opaque` keeps LLVM from subtracting twice, once for the
+            // overlap test and once for `match_from`.
+            let len_minus_offset = opaque((entry - trailer as isize) as usize) as isize;
             // SAFETY: the pending copy is at most 64 bytes, within the
             // output margin.
             let element_out = unsafe { out.add(pending_len) };
@@ -372,18 +358,14 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             let match_from = element_out
                 .cast_const()
                 .wrapping_offset(len_minus_offset - len as isize);
-            // `len_minus_offset > 0`, compared this way so that the branch
-            // can use the flags of the comparison.
-            let overlaps = entry > trailer as isize;
+            let overlaps = len_minus_offset > 0;
             if !WIDE && (len > FAST_COPY || overlaps) {
-                stop = Stop::Tag;
                 break $exit;
             }
             if overlaps {
                 cold();
                 if len & 0x80 != 0 {
                     // Long literal or 4-byte offset copy.
-                    stop = Stop::Tag;
                     break $exit;
                 }
                 // Overlapping copy, or a copy with offset zero.
@@ -391,13 +373,11 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                 // SAFETY: `element_out` was derived from `dst`.
                 let op = unsafe { element_out.offset_from(dst) } as usize;
                 if offset == 0 || offset > op || (offset < 8 && op < 8) {
-                    stop = Stop::Tag;
                     break $exit;
                 }
                 // SAFETY: the next element is within the input margin.
                 if unsafe { next_is_same(ip, next_ip, tag_type) } {
                     // A run of identical copies; see `decode_run`.
-                    stop = Stop::Run;
                     break $exit;
                 }
                 // The pattern comes from the bytes before this element. If
@@ -423,8 +403,11 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             } else {
                 if (match_from as usize) < (dst as usize) {
                     cold();
-                    if tag_type != 0 {
-                        stop = Stop::Tag;
+                    // Literals have a spurious offset and get here near the
+                    // start of the output. `black_box` keeps LLVM from
+                    // testing the tag type first, on the hot path, where
+                    // that branch would mispredict.
+                    if std::hint::black_box(tag_type) != 0 {
                         break $exit;
                     }
                 }
@@ -435,6 +418,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                     ptr::copy(pending_from, out, FAST_COPY);
                     if WIDE && pending_len > FAST_COPY {
                         cold();
+                        align_32::<UNROLL>();
                         // Only a copy-2 tag of 64 bytes (`0xfe`) is longer
                         // than any literal here. If this element repeats it,
                         // the two start a run of identical copies, as found
@@ -450,7 +434,6 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                             && pending_len == 64
                             && next_is_same(ip.sub(3), ip, 2)
                         {
-                            stop = Stop::Run;
                             ip = ip.sub(3);
                             pending_from = NO_COPY.as_ptr();
                             pending_len = 0;
@@ -473,14 +456,22 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     }
 
     'outer: loop {
+        align_32::<UNROLL>();
         step!('outer);
         if UNROLL == 2 {
+            align_32::<UNROLL>();
             step!('outer);
         }
+        align_32::<UNROLL>();
+        // The output test comes first, which keeps both branches clear of
+        // 32-byte boundaries.
         // SAFETY: as for `element_out`.
-        if ip >= ip_limit || unsafe { out.add(pending_len) } >= out_limit {
+        if unsafe { out.add(pending_len) } >= out_limit || ip >= ip_limit {
             break;
         }
+    }
+    if UNROLL == 2 {
+        align_function_64();
     }
     // SAFETY: as in the loop.
     unsafe {
@@ -494,8 +485,89 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
         (
             ip.offset_from(src) as usize - 1,
             out.offset_from(dst) as usize,
-            stop,
         )
+    }
+}
+
+/// Returns the type of `tag` (at `ip - 1`) and the tag that follows its
+/// element: at `ip + (tag >> 2) + 1` for a literal, at `ip + tag_type` for a
+/// copy.
+///
+/// Both candidates are loaded before selecting, which keeps the select off
+/// the load-to-load dependency chain; on x86-64 the select uses the flags of
+/// `tag & 3`, as in the C++ library.
+///
+/// # Safety
+///
+/// Both candidates must be readable. Unless `WIDE`, the literal candidate is
+/// capped at `ip + FAST_COPY + 1`.
+#[inline(always)]
+unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if WIDE {
+        let (tag_type, next_tag);
+        // SAFETY: the caller guarantees both loads are in bounds.
+        unsafe {
+            std::arch::asm!(
+                "mov {t:e}, {tag:e}",
+                "shr {l:e}, 2",
+                "and {t:e}, 3",
+                "movzx {n:e}, byte ptr [{ip} + {t}]",
+                "movzx {l:e}, byte ptr [{ip} + {l} + 1]",
+                "cmovz {n:e}, {l:e}",
+                tag = in(reg) tag,
+                ip = in(reg) ip,
+                t = out(reg) tag_type,
+                n = out(reg) next_tag,
+                l = inout(reg) tag => _,
+                options(pure, readonly, nostack),
+            );
+        }
+        return (tag_type, next_tag);
+    }
+    let tag_type = tag & 3;
+    let literal_len = if WIDE {
+        (tag >> 2) + 1
+    } else {
+        ((tag >> 2) + 1).min(FAST_COPY + 1)
+    };
+    // The volatile reads stop LLVM from turning this into one load from a
+    // selected address.
+    // SAFETY: as documented above.
+    let next_literal = usize::from(unsafe { ptr::read_volatile(ip.add(literal_len)) });
+    let next_copy = usize::from(unsafe { ptr::read_volatile(ip.add(tag_type)) });
+    (tag_type, select_if_zero(tag_type, next_literal, next_copy))
+}
+
+/// Aligns the start of the calling function to 64 bytes (on x86-64), so that
+/// the layout of its loops does not depend on where the linker places it.
+///
+/// That layout matters on cores with Intel's JCC erratum (Skylake to Cascade
+/// Lake and their client parts): a 32-byte block of code holding a jump that
+/// crosses or ends on its boundary is not cached as decoded micro-ops, which
+/// slowed the fast loop by 10-20% in unlucky placements. The directive raises
+/// the alignment of the function's section; it also pads to 64 bytes where it
+/// stands, so it belongs on a path that is taken once per call at most.
+#[inline(always)]
+fn align_function_64() {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: an assembler directive; the padding is executed as nops.
+    unsafe {
+        std::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// In the main fast loop (`UNROLL == 2`), aligns the next instruction to 32
+/// bytes, which keeps its branches clear of 32-byte boundaries (see
+/// [`align_function_64`]).
+#[inline(always)]
+fn align_32<const UNROLL: usize>() {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if UNROLL == 2 {
+        // SAFETY: an assembler directive; the padding is executed as nops.
+        unsafe {
+            std::arch::asm!(".p2align 5", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 

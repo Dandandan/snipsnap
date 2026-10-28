@@ -48,28 +48,32 @@ compares both directions against the `snap` crate and, when built with
 library, on synthetic data, the standard Snappy test corpus, 4 KiB text pages
 and Parquet data pages.
 
-On one core of an Intel Xeon (Sapphire Rapids class, 2.1 GHz base), against
-`snap` 1.1.1 and C++ snappy 1.3.1 built with clang 18, geometric mean over 24
-cases:
+On one core of an Intel Xeon (Cascade Lake class, 2.8 GHz), against `snap`
+1.1.1 and C++ snappy 1.3.1 built with clang 18, geometric mean over 24 cases:
 
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
-| decompress | 8.4 GB/s | 4.0 GB/s | 5.1 GB/s |
-| compress | 3.3 GB/s | 2.8 GB/s | 2.8 GB/s |
+| decompress | 5.1 GB/s | 2.7 GB/s | 3.1 GB/s |
+| compress | 1.8 GB/s | 1.6 GB/s | 1.6 GB/s |
 
-C++ remains a few percent faster at decompressing plain text and HTML in
-large blocks; snipsnap is faster on small blocks and on data with long or
-repeated matches. On the Parquet pages (mostly under 100 bytes), it
-decompresses 2.5x as fast as `snap` and compresses 1.3x as fast.
+snipsnap decompresses text, HTML, URLs and protobuf 1.25–1.36x as fast as C++
+and about 2.2x as fast as `snap`. On the Parquet pages (mostly under 100
+bytes), it decompresses 1.7x as fast as `snap` and compresses 1.05x as fast.
+(An earlier version measured 8.4, 4.0 and 5.1 GB/s for decompression on a
+Sapphire Rapids-class Xeon, a faster machine.)
 
-Decompressing all Snappy pages of a ClickBench partition (`hits_0.parquet`:
-728 pages, 378 MB decoded, mostly 1 MB pages of titles and URLs) runs at
-4.5 GB/s, 1.8x `snap` and 0.94x C++, which stays about 10% ahead on the URL
-columns.
+On ClickBench (`hits_0.parquet`: 728 Snappy pages, 378 MB decoded, mostly
+1 MB pages of titles and URLs), decompressing the pages of the columns that
+each of the 43 queries reads is 1.21x as fast as with C++ and 2.0x as fast as
+with `snap`. URLs, read by 10 of the queries, are most of that work.
 
-Individual cases move by 10–30% with code layout alone (for all three
-libraries), so compare best-of-several runs. C++ snappy is tuned for clang;
-a GCC build decompresses 2–3x slower.
+On Intel cores from Skylake to Cascade Lake, a 32-byte block of code holding
+a branch that crosses or ends on its boundary (the JCC erratum) is decoded
+again on every pass, which slowed the decoder's main loop by 10–20%
+depending on where the linker placed it. That loop is aligned so that its
+branches stay clear of those boundaries. Other cases can still move by
+10–30% with code layout (for all three libraries), so compare best-of-several
+runs. C++ snappy is tuned for clang; a GCC build decompresses 2–3x slower.
 
 ## Status
 
