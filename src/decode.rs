@@ -314,12 +314,18 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             // SAFETY: `tag` is a byte (`select_if_zero` hides that from
             // LLVM), and the reads are within `TAG_READ_SLOP` of the tag. The
             // advance is only used once the tag is known to be a fast-loop
-            // tag.
+            // tag. The narrow loop's margin does not cover the advance of a
+            // literal it leaves to the careful path, hence the wrapping add.
             let (entry, trailer, next_ip) = unsafe {
+                let advance = usize::from(*tables.advance.get_unchecked(tag));
                 (
                     isize::from(*tables.len_minus_offset.get_unchecked(tag)),
                     (read_u32_le(ip) & *OFFSET_MASK.get_unchecked(tag_type)) as usize,
-                    ip.add(usize::from(*tables.advance.get_unchecked(tag))),
+                    if WIDE {
+                        ip.add(advance)
+                    } else {
+                        ip.wrapping_add(advance)
+                    },
                 )
             };
             // Without `opaque` LLVM keeps `entry` alive to test its low byte
