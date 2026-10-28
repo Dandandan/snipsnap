@@ -21,6 +21,10 @@
 use std::mem::MaybeUninit;
 use std::ptr;
 
+use crate::bytes::{
+    copy_16_to_128, copy_exact, copy_short, read_32, read_u32, read_u64, write_16,
+    write_32, write_u16, write_u32, write_u64,
+};
 use crate::select::{opaque, select_if_zero, select_ptr_if_zero};
 use crate::{Error, Result, decode_error};
 
@@ -58,7 +62,7 @@ const fn output_margin(unroll: usize, wide: bool) -> usize {
 }
 
 /// Why [`decode_fast`] returned.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Stop {
     /// It reached one of its limits.
     Limit,
@@ -130,12 +134,7 @@ pub(crate) fn decode_body(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()>
         // SAFETY: `literal` and `dst` both have `dst_len` bytes and cannot
         // overlap, as `dst` is exclusively borrowed.
         unsafe {
-            let (from, to) = (literal.as_ptr(), dst.as_mut_ptr().cast::<u8>());
-            if dst_len <= 64 {
-                copy_short_nonoverlapping(from, to, dst_len);
-            } else {
-                ptr::copy_nonoverlapping(from, to, dst_len);
-            }
+            copy_exact(literal.as_ptr(), dst.as_mut_ptr().cast::<u8>(), dst_len);
         }
         return Ok(());
     }
@@ -143,21 +142,32 @@ pub(crate) fn decode_body(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()>
         // The loops for the ends of the buffers only pay for the cost of
         // entering them after the main one has run, so blocks too small for
         // that are left to the careful path entirely.
-        return decode_careful(src, dst);
+        // SAFETY: `dst` is valid for `dst_len` writes, and nothing has been
+        // decoded yet.
+        return unsafe { decode_careful(src, 0, dst.as_mut_ptr().cast(), dst_len, 0) };
     }
     decode_in_place(src, dst)
 }
 
-/// Decodes with the careful path only.
+/// Decodes the tags from `src[ip]` on with the careful path only, and checks
+/// that they end the output.
+///
+/// # Safety
+///
+/// `op <= dst_len`, `dst` must be valid for `dst_len` writes and `dst[..op]`
+/// must be initialized.
 #[inline(never)]
-fn decode_careful(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
-    let dst_len = dst.len();
-    let dst_ptr = dst.as_mut_ptr().cast::<u8>();
-    let (mut ip, mut op) = (0, 0);
+unsafe fn decode_careful(
+    src: &[u8],
+    mut ip: usize,
+    dst: *mut u8,
+    dst_len: usize,
+    mut op: usize,
+) -> Result<()> {
     while ip < src.len() {
-        // SAFETY: `ip < src.len()`, `op <= dst_len` and `dst_ptr` is valid
-        // for `dst_len` writes.
-        (ip, op) = unsafe { decode_one(src, ip, dst_ptr, dst_len, op)? };
+        // SAFETY: `ip < src.len()`; the rest as documented above, and kept
+        // by `decode_one`.
+        (ip, op) = unsafe { decode_one(src, ip, dst, dst_len, op)? };
     }
     if op != dst_len {
         return decode_error(Error::HeaderMismatch {
@@ -219,50 +229,42 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     while ip < src_len {
         // SAFETY: (for all three calls) the limits leave the margins of the
         // respective loop after the starting positions.
-        let fast = if ip < ip_limit_2 && op < op_limit_2 {
-            Some(unsafe {
+        let (next_ip, next_op, stop) = if ip < ip_limit_2 && op < op_limit_2 {
+            unsafe {
                 decode_fast::<2, true>(src_ptr, ip, ip_limit_2, dst_ptr, op, op_limit_2)
-            })
+            }
         } else if ip < ip_limit_1 && op < op_limit_1 {
-            Some(unsafe {
+            unsafe {
                 decode_fast::<1, true>(src_ptr, ip, ip_limit_1, dst_ptr, op, op_limit_1)
-            })
+            }
         } else if ip < ip_limit_n && op < op_limit_n {
-            Some(unsafe {
+            unsafe {
                 decode_fast::<1, false>(src_ptr, ip, ip_limit_n, dst_ptr, op, op_limit_n)
-            })
+            }
         } else {
-            None
+            // `ip` and `op` only grow, and the narrow loop has the largest
+            // limits, so none of the loops applies again.
+            break;
         };
-        if let Some((next_ip, next_op, stop)) = fast {
-            (ip, op) = (next_ip, next_op);
-            match stop {
-                Stop::Limit => continue,
-                Stop::Tag => {}
-                Stop::Run => {
-                    // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr`
-                    // is valid for `dst_len` writes.
-                    if let Some(next) =
-                        unsafe { decode_run(src, ip, dst_ptr, dst_len, op) }
-                    {
-                        (ip, op) = next;
-                        continue;
-                    }
+        (ip, op) = (next_ip, next_op);
+        match stop {
+            Stop::Limit => continue,
+            Stop::Tag => {}
+            Stop::Run => {
+                // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr` is
+                // valid for `dst_len` writes.
+                if let Some(next) = unsafe { decode_run(src, ip, dst_ptr, dst_len, op) } {
+                    (ip, op) = next;
+                    continue;
                 }
             }
         }
-        // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr` is valid for
-        // `dst_len` writes.
+        // SAFETY: as for `decode_run`.
         (ip, op) = unsafe { decode_one(src, ip, dst_ptr, dst_len, op)? };
     }
-
-    if op != dst_len {
-        return decode_error(Error::HeaderMismatch {
-            expected: dst_len,
-            actual: op,
-        });
-    }
-    Ok(())
+    // SAFETY: `op <= dst_len`, `dst_ptr` is valid for `dst_len` writes and
+    // `dst[..op]` was decoded.
+    unsafe { decode_careful(src, ip, dst_ptr, dst_len, op) }
 }
 
 /// Decodes tags, `UNROLL` (1 or 2) per limit check, until `ip >= ip_limit`,
@@ -348,7 +350,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                 let advance = usize::from(*tables.advance.get_unchecked(tag));
                 (
                     isize::from(*tables.len_minus_offset.get_unchecked(tag)),
-                    (read_u32_le(ip) & *OFFSET_MASK.get_unchecked(tag_type)) as usize,
+                    (read_u32(ip) & *OFFSET_MASK.get_unchecked(tag_type)) as usize,
                     if WIDE {
                         ip.add(advance)
                     } else {
@@ -359,10 +361,8 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             // Without `opaque` LLVM keeps `entry` alive to test its low byte
             // on the cold path, which costs a register copy per tag.
             let len = opaque((entry & 0xff) as usize);
-            // SAFETY: `entry` is in `-1792..=255` and `trailer` in
-            // `0..=0xffff`, so this cannot overflow; saying so lets LLVM
-            // branch on the flags of the subtraction.
-            let len_minus_offset = unsafe { entry.unchecked_sub(trailer as isize) };
+            // `entry` is in `-1792..=255` and `trailer` in `0..=0xffff`.
+            let len_minus_offset = entry - trailer as isize;
             // SAFETY: the pending copy is at most 64 bytes, within the
             // output margin.
             let element_out = unsafe { out.add(pending_len) };
@@ -540,7 +540,7 @@ const MAX_RUN_PERIOD: usize = 112;
 unsafe fn next_is_same(ip: *const u8, next_ip: *const u8, tag_type: usize) -> bool {
     unsafe {
         let mask = if tag_type == 1 { 0xffff } else { 0xff_ffff };
-        (read_u32_le(ip.sub(1)) ^ read_u32_le(next_ip.sub(1))) & mask == 0
+        (read_u32(ip.sub(1)) ^ read_u32(next_ip.sub(1))) & mask == 0
     }
 }
 
@@ -568,7 +568,7 @@ unsafe fn decode_run(
     let tag = src[ip];
     let (size, len, offset) = match tag & 3 {
         1 => {
-            let offset_low = *src.get(ip + 1)?;
+            let &offset_low = src.get(ip + 1)?;
             (
                 2,
                 4 + usize::from((tag >> 2) & 7),
@@ -576,11 +576,11 @@ unsafe fn decode_run(
             )
         }
         2 => {
-            let bytes = src.get(ip + 1..ip + 3)?;
+            let bytes = src.get(ip + 1..ip + 3)?.try_into().ok()?;
             (
                 3,
                 1 + usize::from(tag >> 2),
-                usize::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+                usize::from(u16::from_le_bytes(bytes)),
             )
         }
         _ => return None,
@@ -592,30 +592,18 @@ unsafe fn decode_run(
     // Leave room for the overshoot of `fill_periodic`.
     let max_count = (dst_len - op).saturating_sub(MAX_RUN_PERIOD) / len;
     // Elements are compared as masked four-byte words, which compiles to a
-    // load and a compare rather than a call to `bcmp`, and exactly in the
-    // last bytes of the input.
+    // load and a compare rather than a call to `bcmp`. Elements in the last
+    // three bytes of the input are left to the careful path.
     let mask = if size == 2 { 0xffff } else { 0xff_ffff };
-    let word = |at: usize| {
-        src.get(at..at + 4).map(|bytes| {
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & mask
-        })
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(src.get(at..at + 4)?.try_into().ok()?) & mask)
     };
-    let element = [src[ip], src[ip + 1], src.get(ip + 2).copied().unwrap_or(0)];
-    let element = &element[..size];
+    let value = word(ip)?;
     let mut count = 1;
     let mut next = ip + size;
-    if let Some(value) = word(ip) {
-        while count < max_count {
-            match word(next) {
-                Some(next_value) if next_value == value => {}
-                Some(_) => break,
-                // Fewer than four bytes left.
-                None if src.get(next..next + size) == Some(element) => {}
-                None => break,
-            }
-            count += 1;
-            next += size;
-        }
+    while count < max_count && word(next) == Some(value) {
+        count += 1;
+        next += size;
     }
     if count < 2 {
         return None;
@@ -677,48 +665,36 @@ unsafe fn decode_one(
     let dst_remaining = dst_len - op;
 
     if tag & 3 == 0 {
-        let mut len = usize::from(tag >> 2) + 1;
+        let mut len = u64::from(tag >> 2) + 1;
         if len > 60 {
-            let len_bytes = len - 60;
-            if len_bytes > src_len - ip {
+            // The length less one follows in `len - 60` little-endian bytes.
+            let len_bytes = (len - 60) as usize;
+            let Some(bytes) = src.get(ip..ip + len_bytes) else {
                 return decode_error(Error::LiteralRead {
                     len: len_bytes as u64,
                     remaining: (src_len - ip) as u64,
                 });
-            }
-            let mut value = 0u64;
-            for (i, &byte) in src[ip..ip + len_bytes].iter().enumerate() {
-                value |= u64::from(byte) << (8 * i);
-            }
+            };
+            len = bytes
+                .iter()
+                .rev()
+                .fold(0, |value, &byte| value << 8 | u64::from(byte))
+                + 1;
             ip += len_bytes;
-            let len64 = value + 1;
-            if len64 > (src_len - ip) as u64 {
-                return decode_error(Error::LiteralRead {
-                    len: len64,
-                    remaining: (src_len - ip) as u64,
-                });
-            }
-            if len64 > dst_remaining as u64 {
-                return decode_error(Error::LiteralWrite {
-                    len: len64,
-                    remaining: dst_remaining as u64,
-                });
-            }
-            len = len64 as usize;
-        } else {
-            if len > src_len - ip {
-                return decode_error(Error::LiteralRead {
-                    len: len as u64,
-                    remaining: (src_len - ip) as u64,
-                });
-            }
-            if len > dst_remaining {
-                return decode_error(Error::LiteralWrite {
-                    len: len as u64,
-                    remaining: dst_remaining as u64,
-                });
-            }
         }
+        if len > (src_len - ip) as u64 {
+            return decode_error(Error::LiteralRead {
+                len,
+                remaining: (src_len - ip) as u64,
+            });
+        }
+        if len > dst_remaining as u64 {
+            return decode_error(Error::LiteralWrite {
+                len,
+                remaining: dst_remaining as u64,
+            });
+        }
+        let len = len as usize;
         // SAFETY: both ranges were bounds checked above; the wide path only
         // runs when there is room for the overshoot on both sides.
         unsafe {
@@ -726,52 +702,43 @@ unsafe fn decode_one(
             let to = dst.add(op);
             if len <= 16 && src_len - ip >= 16 && dst_remaining >= 16 {
                 ptr::copy_nonoverlapping(from, to, 16);
-            } else if len <= 64 {
-                copy_short_nonoverlapping(from, to, len);
             } else {
-                ptr::copy_nonoverlapping(from, to, len);
+                copy_exact(from, to, len);
             }
         }
         return Ok((ip + len, op + len));
     }
 
-    let (len, offset) = match tag & 3 {
+    let truncated = |len: u64| {
+        decode_error(Error::CopyRead {
+            len,
+            remaining: (src_len - ip) as u64,
+        })
+    };
+    let (len, offset, size) = match tag & 3 {
         1 => {
-            if ip >= src_len {
-                return decode_error(Error::CopyRead {
-                    len: 1,
-                    remaining: 0,
-                });
-            }
-            let offset = (usize::from(tag & 0xe0) << 3) | usize::from(src[ip]);
-            ip += 1;
-            (4 + usize::from((tag >> 2) & 7), offset)
+            let Some(&low) = src.get(ip) else {
+                return truncated(1);
+            };
+            let offset = (usize::from(tag & 0xe0) << 3) | usize::from(low);
+            (4 + usize::from((tag >> 2) & 7), offset, 1)
         }
         2 => {
-            if 2 > src_len - ip {
-                return decode_error(Error::CopyRead {
-                    len: 2,
-                    remaining: (src_len - ip) as u64,
-                });
-            }
-            let offset = usize::from(u16::from_le_bytes([src[ip], src[ip + 1]]));
-            ip += 2;
-            (1 + usize::from(tag >> 2), offset)
+            let Some(&[low, high]) = src.get(ip..ip + 2) else {
+                return truncated(2);
+            };
+            let offset = usize::from(u16::from_le_bytes([low, high]));
+            (1 + usize::from(tag >> 2), offset, 2)
         }
         _ => {
-            if 4 > src_len - ip {
-                return decode_error(Error::CopyRead {
-                    len: 4,
-                    remaining: (src_len - ip) as u64,
-                });
-            }
-            let offset =
-                u32::from_le_bytes([src[ip], src[ip + 1], src[ip + 2], src[ip + 3]])
-                    as usize;
-            ip += 4;
-            (1 + usize::from(tag >> 2), offset)
+            let Some(&[b0, b1, b2, b3]) = src.get(ip..ip + 4) else {
+                return truncated(4);
+            };
+            let offset = u32::from_le_bytes([b0, b1, b2, b3]) as usize;
+            (1 + usize::from(tag >> 2), offset, 4)
         }
     };
+    ip += size;
     if offset == 0 || offset > op {
         return decode_error(Error::Offset {
             offset,
@@ -811,12 +778,10 @@ unsafe fn copy_match(
             if dst_remaining >= 64 {
                 ptr::copy(from, to, 64);
             } else {
-                copy_short_nonoverlapping(from, to, len);
+                copy_short(from, to, len);
             }
-        } else if offset < 8 {
+        } else if offset <= 8 {
             copy_short_pattern(to, offset, len, op);
-        } else if offset == 8 {
-            fill_period_8(to, read_u64_le(from), offset, len);
         } else if dst_remaining >= TAG_WRITE_SLOP {
             copy_overlapping(to, to, offset, len);
         } else {
@@ -824,10 +789,10 @@ unsafe fn copy_match(
             // the `offset > 8` bytes before `to`, which are not written.
             let mut i = 0;
             while len - i > offset {
-                copy_short_nonoverlapping(from, to.add(i), offset);
+                copy_short(from, to.add(i), offset);
                 i += offset;
             }
-            copy_short_nonoverlapping(from, to.add(i), len - i);
+            copy_short(from, to.add(i), len - i);
         }
     }
 }
@@ -840,25 +805,24 @@ unsafe fn copy_match(
 /// initialized and `dst[..len]` valid for writes.
 #[inline(always)]
 unsafe fn copy_short_pattern(dst: *mut u8, offset: usize, len: usize, op: usize) {
-    debug_assert!((1..8).contains(&offset) && offset < len && len <= 64 && offset <= op);
+    debug_assert!((1..=8).contains(&offset) && offset < len && len <= 64 && offset <= op);
     unsafe {
-        // The low `offset` bytes of `seed` are the pattern.
-        let seed = if op >= 8 {
-            read_u64_le(dst.sub(8)) >> (8 * (8 - offset))
+        let pattern = if op >= 8 {
+            pattern_8(dst, offset)
         } else {
             // Only the `offset` bytes before `dst` are initialized: read
             // them in two pieces that may overlap.
             let from = dst.sub(offset);
-            if offset >= 4 {
-                u64::from(read_u32_le(from))
-                    | u64::from(read_u32_le(dst.sub(4))) << (8 * (offset - 4))
+            let seed = if offset >= 4 {
+                u64::from(read_u32(from))
+                    | u64::from(read_u32(dst.sub(4))) << (8 * (offset - 4))
             } else {
                 u64::from(*from)
                     | u64::from(*from.add(offset / 2)) << (8 * (offset / 2))
                     | u64::from(*from.add(offset - 1)) << (8 * (offset - 1))
-            }
+            };
+            seed.wrapping_mul(REPEAT_MUL[offset])
         };
-        let pattern = seed.wrapping_mul(REPEAT_MUL[offset]);
         if offset.is_power_of_two() {
             fill_period_8(dst, pattern, offset, len);
             return;
@@ -866,7 +830,7 @@ unsafe fn copy_short_pattern(dst: *mut u8, offset: usize, len: usize, op: usize)
         let stride = REPEAT_STRIDE[offset];
         let mut i = 0;
         while i + 8 <= len {
-            write_u64_le(dst.add(i), pattern);
+            write_u64(dst.add(i), pattern);
             i += stride;
         }
         // `i` is a multiple of the offset, so the tail starts the pattern
@@ -874,17 +838,11 @@ unsafe fn copy_short_pattern(dst: *mut u8, offset: usize, len: usize, op: usize)
         let tail = len - i;
         let to = dst.add(i);
         if tail >= 4 {
-            ptr::write_unaligned(to.cast::<u32>(), (pattern as u32).to_le());
-            ptr::write_unaligned(
-                to.add(tail - 4).cast::<u32>(),
-                ((pattern >> (8 * (tail - 4))) as u32).to_le(),
-            );
+            write_u32(to, pattern as u32);
+            write_u32(to.add(tail - 4), (pattern >> (8 * (tail - 4))) as u32);
         } else if tail >= 2 {
-            ptr::write_unaligned(to.cast::<u16>(), (pattern as u16).to_le());
-            ptr::write_unaligned(
-                to.add(tail - 2).cast::<u16>(),
-                ((pattern >> (8 * (tail - 2))) as u16).to_le(),
-            );
+            write_u16(to, pattern as u16);
+            write_u16(to.add(tail - 2), (pattern >> (8 * (tail - 2))) as u16);
         } else if tail == 1 {
             *to = pattern as u8;
         }
@@ -922,72 +880,24 @@ unsafe fn fill_period_8(dst: *mut u8, pattern: u64, offset: usize, len: usize) {
             }
             write_16(dst.add(len - 16), end);
         } else if len >= 8 {
-            write_u64_le(dst, pattern);
-            write_u64_le(dst.add(len - 8), end);
+            write_u64(dst, pattern);
+            write_u64(dst.add(len - 8), end);
         } else if len >= 4 {
-            ptr::write_unaligned(dst.cast::<u32>(), (pattern as u32).to_le());
-            ptr::write_unaligned(
-                dst.add(len - 4).cast::<u32>(),
-                ((end >> 32) as u32).to_le(),
-            );
+            write_u32(dst, pattern as u32);
+            write_u32(dst.add(len - 4), (end >> 32) as u32);
         } else {
-            ptr::write_unaligned(dst.cast::<u16>(), (pattern as u16).to_le());
-            ptr::write_unaligned(
-                dst.add(len - 2).cast::<u16>(),
-                ((end >> 48) as u16).to_le(),
-            );
-        }
-    }
-}
-
-/// Copies exactly `len` bytes, `16 <= len <= 128`, between non-overlapping
-/// ranges, as two fixed-size copies that may overlap each other.
-///
-/// Written as a loop of 16-byte copies, this compiles to a call to `memcpy`.
-#[inline(always)]
-unsafe fn copy_16_to_128(from: *const u8, to: *mut u8, len: usize) {
-    debug_assert!((16..=128).contains(&len));
-    unsafe {
-        if len > 64 {
-            ptr::copy_nonoverlapping(from, to, 64);
-            ptr::copy_nonoverlapping(from.add(len - 64), to.add(len - 64), 64);
-        } else if len > 32 {
-            ptr::copy_nonoverlapping(from, to, 32);
-            ptr::copy_nonoverlapping(from.add(len - 32), to.add(len - 32), 32);
-        } else {
-            ptr::copy_nonoverlapping(from, to, 16);
-            ptr::copy_nonoverlapping(from.add(len - 16), to.add(len - 16), 16);
-        }
-    }
-}
-
-/// Copies exactly `len <= 64` bytes between non-overlapping ranges.
-#[inline(always)]
-unsafe fn copy_short_nonoverlapping(from: *const u8, to: *mut u8, len: usize) {
-    debug_assert!(len <= 64);
-    unsafe {
-        if len >= 16 {
-            copy_16_to_128(from, to, len);
-        } else if len >= 8 {
-            ptr::copy_nonoverlapping(from, to, 8);
-            ptr::copy_nonoverlapping(from.add(len - 8), to.add(len - 8), 8);
-        } else if len >= 4 {
-            ptr::copy_nonoverlapping(from, to, 4);
-            ptr::copy_nonoverlapping(from.add(len - 4), to.add(len - 4), 4);
-        } else if len > 0 {
-            *to = *from;
-            *to.add(len / 2) = *from.add(len / 2);
-            *to.add(len - 1) = *from.add(len - 1);
+            write_u16(dst, pattern as u16);
+            write_u16(dst.add(len - 2), (end >> 48) as u16);
         }
     }
 }
 
 /// `sum(1 << (8 * offset * k))` over the copies of an `offset`-byte pattern
 /// that fit in 8 bytes, indexed by offset.
-static REPEAT_MUL: [u64; 8] = {
-    let mut table = [0u64; 8];
+static REPEAT_MUL: [u64; 9] = {
+    let mut table = [0u64; 9];
     let mut offset = 1;
-    while offset < 8 {
+    while offset <= 8 {
         let mut shift = 0;
         while shift < 8 {
             table[offset] |= 1 << (8 * shift);
@@ -999,7 +909,20 @@ static REPEAT_MUL: [u64; 8] = {
 };
 
 /// Largest multiple of the offset that is at most 8, indexed by offset.
-static REPEAT_STRIDE: [usize; 8] = [8, 8, 8, 6, 8, 5, 6, 7];
+static REPEAT_STRIDE: [usize; 9] = [8, 8, 8, 6, 8, 5, 6, 7, 8];
+
+/// Eight bytes of the pattern that repeats the `offset <= 8` bytes before
+/// `end`, starting with the first of them.
+///
+/// # Safety
+///
+/// The 8 bytes before `end` must be readable and initialized.
+#[inline(always)]
+unsafe fn pattern_8(end: *const u8, offset: usize) -> u64 {
+    debug_assert!((1..=8).contains(&offset));
+    let tail = unsafe { read_u64(end.sub(8)) };
+    (tail >> (8 * (8 - offset))).wrapping_mul(REPEAT_MUL[offset])
+}
 
 /// Writes `len` bytes at `dst` repeating the `offset` bytes before it, in
 /// whole periods: up to 95 bytes in total (for an offset just below 64).
@@ -1021,41 +944,20 @@ unsafe fn copy_overlapping(before: *const u8, dst: *mut u8, offset: usize, len: 
         if offset < 8 {
             // Build eight bytes of the pattern from the last eight output
             // bytes, then store it at a stride that keeps the phase.
-            let tail = read_u64_le(before.sub(8));
-            let pattern = (tail >> (8 * (8 - offset))).wrapping_mul(REPEAT_MUL[offset]);
+            let pattern = pattern_8(before, offset);
             let stride = REPEAT_STRIDE[offset];
             let mut i = 0;
             loop {
-                write_u64_le(dst.add(i), pattern);
+                write_u64(dst.add(i), pattern);
                 i += stride;
                 if i >= len {
                     break;
                 }
             }
         } else if offset < 16 {
-            let head = read_u64_le(before.sub(offset));
-            let tail = read_u64_le(before.sub(8));
-            let mut i = 0;
-            loop {
-                write_u64_le(dst.add(i), head);
-                write_u64_le(dst.add(i + offset - 8), tail);
-                i += offset;
-                if i >= len {
-                    break;
-                }
-            }
+            copy_periods::<8>(before, dst, offset, len);
         } else if offset < 32 {
-            let head = read_16(before.sub(offset));
-            let tail = read_16(before.sub(16));
-            let mut i = 0;
-            loop {
-                write_16(dst.add(i), head);
-                write_16(dst.add(i + offset - 16), tail);
-                i += offset;
-                if i >= len {
-                    break;
-                }
-            }
+            copy_periods::<16>(before, dst, offset, len);
         } else {
             // 32 <= offset < len <= 64: two periods at most.
             let head = read_32(before.sub(offset));
@@ -1067,37 +969,31 @@ unsafe fn copy_overlapping(before: *const u8, dst: *mut u8, offset: usize, len: 
     }
 }
 
+/// Writes whole periods of the `offset` bytes before `before` at `dst`, for
+/// `W <= offset < 2 * W`, as a `W`-byte head and a `W`-byte tail each.
+///
+/// # Safety
+///
+/// As for [`copy_overlapping`].
 #[inline(always)]
-unsafe fn read_u32_le(ptr: *const u8) -> u32 {
-    u32::from_le(unsafe { ptr::read_unaligned(ptr.cast::<u32>()) })
-}
-
-#[inline(always)]
-unsafe fn read_u64_le(ptr: *const u8) -> u64 {
-    u64::from_le(unsafe { ptr::read_unaligned(ptr.cast::<u64>()) })
-}
-
-#[inline(always)]
-unsafe fn write_u64_le(ptr: *mut u8, value: u64) {
-    unsafe { ptr::write_unaligned(ptr.cast::<u64>(), value.to_le()) }
-}
-
-#[inline(always)]
-unsafe fn read_16(ptr: *const u8) -> [u8; 16] {
-    unsafe { ptr::read_unaligned(ptr.cast::<[u8; 16]>()) }
-}
-
-#[inline(always)]
-unsafe fn write_16(ptr: *mut u8, value: [u8; 16]) {
-    unsafe { ptr::write_unaligned(ptr.cast::<[u8; 16]>(), value) }
-}
-
-#[inline(always)]
-unsafe fn read_32(ptr: *const u8) -> [u8; 32] {
-    unsafe { ptr::read_unaligned(ptr.cast::<[u8; 32]>()) }
-}
-
-#[inline(always)]
-unsafe fn write_32(ptr: *mut u8, value: [u8; 32]) {
-    unsafe { ptr::write_unaligned(ptr.cast::<[u8; 32]>(), value) }
+unsafe fn copy_periods<const W: usize>(
+    before: *const u8,
+    dst: *mut u8,
+    offset: usize,
+    len: usize,
+) {
+    debug_assert!(W <= offset && offset < 2 * W);
+    unsafe {
+        let head = ptr::read_unaligned(before.sub(offset).cast::<[u8; W]>());
+        let tail = ptr::read_unaligned(before.sub(W).cast::<[u8; W]>());
+        let mut i = 0;
+        loop {
+            ptr::write_unaligned(dst.add(i).cast::<[u8; W]>(), head);
+            ptr::write_unaligned(dst.add(i + offset - W).cast::<[u8; W]>(), tail);
+            i += offset;
+            if i >= len {
+                break;
+            }
+        }
+    }
 }

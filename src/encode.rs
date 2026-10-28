@@ -18,7 +18,8 @@
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use crate::select::opaque;
+use crate::bytes::{copy_16, copy_exact, read_16, read_u32, read_u64, write_u32};
+use crate::select::{opaque, select_if_below_2048, select_if_low_zero};
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
 
 /// Input is compressed in independent blocks of this size.
@@ -44,6 +45,16 @@ impl Encoder {
 
     #[inline]
     pub(crate) fn compress(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
+        // SAFETY: the encoder writes only initialized bytes.
+        self.compress_uninit(input, unsafe { as_uninit(output) })
+    }
+
+    #[inline]
+    fn compress_uninit(
+        &mut self,
+        input: &[u8],
+        output: &mut [MaybeUninit<u8>],
+    ) -> Result<usize> {
         check_output_len(input.len(), output.len())?;
         let needed = table_size(input.len().min(BLOCK_SIZE));
         if self.table.len() < needed {
@@ -61,16 +72,49 @@ impl Encoder {
     }
 
     pub(crate) fn compress_vec(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut output = vec![0; max_compress_len(input.len())];
-        let len = self.compress(input, &mut output)?;
-        output.truncate(len);
-        Ok(output)
+        compress_to_new_vec(input, |output| self.compress_uninit(input, output))
     }
+}
+
+/// One-shot compression into a new `Vec`.
+pub(crate) fn compress_vec(input: &[u8]) -> Result<Vec<u8>> {
+    compress_to_new_vec(input, |output| compress_into_uninit(input, output))
+}
+
+/// Compresses `input` with `compress` into a new `Vec`, without zero-filling
+/// it first.
+fn compress_to_new_vec(
+    input: &[u8],
+    compress: impl FnOnce(&mut [MaybeUninit<u8>]) -> Result<usize>,
+) -> Result<Vec<u8>> {
+    let max_len = max_compress_len(input.len());
+    let mut output = Vec::with_capacity(max_len);
+    let len = compress(&mut output.spare_capacity_mut()[..max_len])?;
+    // SAFETY: the encoder initialized the first `len` bytes.
+    unsafe { output.set_len(len) };
+    Ok(output)
+}
+
+/// One-shot compression.
+pub(crate) fn compress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    // SAFETY: the encoder writes only initialized bytes.
+    compress_into_uninit(input, unsafe { as_uninit(output) })
+}
+
+/// Views `output` as possibly uninitialized bytes.
+///
+/// # Safety
+///
+/// Only initialized bytes may be written through the result.
+unsafe fn as_uninit(output: &mut [u8]) -> &mut [MaybeUninit<u8>] {
+    // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and the caller keeps
+    // the bytes initialized.
+    unsafe { &mut *(output as *mut [u8] as *mut [MaybeUninit<u8>]) }
 }
 
 /// One-shot compression, without allocating a hash table for small inputs
 /// or clearing it after the last block.
-pub(crate) fn compress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
+fn compress_into_uninit(input: &[u8], output: &mut [MaybeUninit<u8>]) -> Result<usize> {
     check_output_len(input.len(), output.len())?;
     if input.len() < MIN_SEARCH_LEN {
         // SAFETY: the output length was checked, and inputs this short are
@@ -135,37 +179,28 @@ fn table_size(block_len: usize) -> usize {
 #[inline(always)]
 unsafe fn compress_checked(
     input: &[u8],
-    output: &mut [u8],
+    output: &mut [MaybeUninit<u8>],
     table: &mut [u16],
     reuse: bool,
 ) -> usize {
     debug_assert!(output.len() >= max_compress_len(input.len()));
     let mut op = write_varint(output, input.len() as u32);
+    let output_len = output.len();
+    let output = output.as_mut_ptr().cast::<u8>();
     // SAFETY: (for both branches) as documented above.
     unsafe {
         if input.len() <= BLOCK_SIZE {
-            op += compress_block_restoring(
-                input,
-                output.as_mut_ptr().add(op),
-                table,
-                reuse,
-            );
+            op += compress_block_restoring(input, output.add(op), table, reuse);
         } else {
             let mut blocks = input.chunks(BLOCK_SIZE);
             let last = blocks.next_back().unwrap();
             for block in blocks {
-                op += compress_block_restoring(
-                    block,
-                    output.as_mut_ptr().add(op),
-                    table,
-                    true,
-                );
+                op += compress_block_restoring(block, output.add(op), table, true);
             }
-            op +=
-                compress_block_restoring(last, output.as_mut_ptr().add(op), table, reuse);
+            op += compress_block_restoring(last, output.add(op), table, reuse);
         }
     }
-    debug_assert!(op <= output.len());
+    debug_assert!(op <= output_len);
     op
 }
 
@@ -245,25 +280,20 @@ const REPLAY_MIN_TABLE_SIZE: usize = 1 << 12;
 
 /// Clears the table entries written for a block that was emitted as a
 /// single literal, by repeating the probes of [`compress_block`]'s search
-/// for a match.
+/// for a match, unrolled the same way.
 fn clear_probed(input: &[u8], table: &mut [u16]) {
     debug_assert!(input.len() >= MIN_SEARCH_LEN);
-    clear_search(input, table, 0, None);
-    debug_assert!(table.iter().all(|&entry| entry == 0));
-}
-
-/// Clears the entries probed by a search for a match that started after
-/// `next_emit` and found one at `found`, or ran out of input.
-fn clear_search(input: &[u8], table: &mut [u16], next_emit: usize, found: Option<usize>) {
     let ip_limit = input.len() - INPUT_MARGIN;
-    let mut ip = next_emit + 1;
+    let mask = table.len() as u32 - 1;
+    let mut clear = |pos: usize| {
+        let bytes = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
+        table[hash(bytes, mask)] = 0;
+    };
+    let mut ip = 1;
     let mut skip = 32u32;
     if ip + 16 <= ip_limit {
         for i in 0..16 {
-            clear_entry(input, table, ip + i);
-            if found == Some(ip + i) {
-                return;
-            }
+            clear(ip + i);
         }
         ip += 16;
         skip += 16;
@@ -272,32 +302,22 @@ fn clear_search(input: &[u8], table: &mut [u16], next_emit: usize, found: Option
         let step = (skip >> 5) as usize;
         skip += step as u32;
         if ip + step > ip_limit {
-            debug_assert!(found.is_none());
-            return;
+            break;
         }
-        clear_entry(input, table, ip);
-        if found == Some(ip) {
-            return;
-        }
+        clear(ip);
         ip += step;
     }
+    debug_assert!(table.iter().all(|&entry| entry == 0));
 }
 
-#[inline(always)]
-fn clear_entry(input: &[u8], table: &mut [u16], pos: usize) {
-    let bytes = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
-    let mask = table.len() as u32 - 1;
-    table[hash(bytes, mask)] = 0;
-}
-
-fn write_varint(output: &mut [u8], mut value: u32) -> usize {
+fn write_varint(output: &mut [MaybeUninit<u8>], mut value: u32) -> usize {
     let mut i = 0;
     while value >= 0x80 {
-        output[i] = value as u8 | 0x80;
+        output[i].write(value as u8 | 0x80);
         value >>= 7;
         i += 1;
     }
-    output[i] = value as u8;
+    output[i].write(value as u8);
     i + 1
 }
 
@@ -566,69 +586,6 @@ unsafe fn find_match_length(
 /// time after it.
 const LONG_MATCH: usize = 64;
 
-/// Returns `if_zero` if the low 32 bits of `xor` are zero, else `otherwise`.
-///
-/// The choice depends on where two inputs first differ, which is hard to
-/// predict, so this uses a conditional move rather than a branch.
-#[inline(always)]
-fn select_if_low_zero(xor: u64, if_zero: u64, otherwise: u64) -> u64 {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    {
-        let mut result = otherwise;
-        // SAFETY: register-only instructions without memory access.
-        unsafe {
-            std::arch::asm!(
-                "test {x:e}, {x:e}",
-                "cmovz {r}, {z}",
-                x = in(reg) xor,
-                z = in(reg) if_zero,
-                r = inout(reg) result,
-                options(pure, nomem, nostack),
-            );
-        }
-        result
-    }
-    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
-    {
-        if xor as u32 == 0 { if_zero } else { otherwise }
-    }
-}
-
-/// Returns `below` if `offset < 2048`, else `otherwise`, with a conditional
-/// move (see [`emit_copy_at_most_64`]).
-#[inline(always)]
-fn select_if_below_2048(offset: u32, below: u32, otherwise: u32) -> u32 {
-    let mut result = below;
-    // SAFETY: (for both) register-only instructions without memory access.
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    unsafe {
-        std::arch::asm!(
-            "cmp {o:e}, 2048",
-            "cmovae {r:e}, {x:e}",
-            o = in(reg) offset,
-            x = in(reg) otherwise,
-            r = inout(reg) result,
-            options(pure, nomem, nostack),
-        );
-    }
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    unsafe {
-        std::arch::asm!(
-            "cmp {o:w}, #2048",
-            "csel {r:w}, {r:w}, {x:w}, lo",
-            o = in(reg) offset,
-            x = in(reg) otherwise,
-            r = inout(reg) result,
-            options(pure, nomem, nostack),
-        );
-    }
-    #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
-    if offset >= 2048 {
-        result = otherwise;
-    }
-    result
-}
-
 /// Emits a literal inside the main loop, where up to 15 bytes may be read
 /// past it and written past its end.
 ///
@@ -647,6 +604,9 @@ unsafe fn emit_literal_fast(op: *mut u8, literal: *const u8, len: usize) -> *mut
         }
         let op = emit_literal_tag(op, len);
         if len <= 64 {
+            // LLVM turns this loop into a call to `memcpy` of `len` rounded
+            // up to 16 bytes, which measured faster here than inline copies
+            // or a `memcpy` of exactly `len` bytes.
             let mut i = 0;
             loop {
                 copy_16(literal.add(i), op.add(i));
@@ -674,44 +634,6 @@ unsafe fn emit_literal(op: *mut u8, literal: *const u8, len: usize) -> *mut u8 {
         let op = emit_literal_tag(op, len);
         copy_exact(literal, op, len);
         op.add(len)
-    }
-}
-
-/// Copies `len` bytes: up to 64 inline, as fixed-size copies that may
-/// overlap each other, and more with `memcpy`. Small blocks often end in a
-/// short literal, where a call would cost more than the copy.
-///
-/// # Safety
-///
-/// As for [`ptr::copy_nonoverlapping`].
-#[inline(always)]
-unsafe fn copy_exact(from: *const u8, to: *mut u8, len: usize) {
-    unsafe {
-        if len > 64 {
-            ptr::copy_nonoverlapping(from, to, len);
-        } else if len > 32 {
-            copy_16(from, to);
-            copy_16(from.add(16), to.add(16));
-            copy_16(from.add(len - 32), to.add(len - 32));
-            copy_16(from.add(len - 16), to.add(len - 16));
-        } else if len >= 16 {
-            copy_16(from, to);
-            copy_16(from.add(len - 16), to.add(len - 16));
-        } else if len >= 8 {
-            let (head, tail) = (read_u64(from), read_u64(from.add(len - 8)));
-            write_u64(to, head);
-            write_u64(to.add(len - 8), tail);
-        } else if len >= 4 {
-            let (head, tail) = (read_u32(from), read_u32(from.add(len - 4)));
-            write_u32(to, head);
-            write_u32(to.add(len - 4), tail);
-        } else if len > 0 {
-            // Bytes 0, `len / 2` and `len - 1` cover lengths 1 to 3.
-            let (a, b, c) = (*from, *from.add(len / 2), *from.add(len - 1));
-            *to = a;
-            *to.add(len / 2) = b;
-            *to.add(len - 1) = c;
-        }
     }
 }
 
@@ -799,34 +721,4 @@ unsafe fn emit_copy(mut op: *mut u8, offset: usize, mut len: usize) -> *mut u8 {
             emit_copy_at_most_64::<false>(op, offset, len)
         }
     }
-}
-
-#[inline(always)]
-unsafe fn read_u32(ptr: *const u8) -> u32 {
-    u32::from_le(unsafe { ptr::read_unaligned(ptr.cast::<u32>()) })
-}
-
-#[inline(always)]
-unsafe fn read_u64(ptr: *const u8) -> u64 {
-    u64::from_le(unsafe { ptr::read_unaligned(ptr.cast::<u64>()) })
-}
-
-#[inline(always)]
-unsafe fn write_u32(ptr: *mut u8, value: u32) {
-    unsafe { ptr::write_unaligned(ptr.cast::<u32>(), value.to_le()) }
-}
-
-#[inline(always)]
-unsafe fn write_u64(ptr: *mut u8, value: u64) {
-    unsafe { ptr::write_unaligned(ptr.cast::<u64>(), value.to_le()) }
-}
-
-#[inline(always)]
-unsafe fn read_16(ptr: *const u8) -> [u8; 16] {
-    unsafe { ptr::read_unaligned(ptr.cast::<[u8; 16]>()) }
-}
-
-#[inline(always)]
-unsafe fn copy_16(from: *const u8, to: *mut u8) {
-    unsafe { ptr::copy_nonoverlapping(from, to, 16) }
 }

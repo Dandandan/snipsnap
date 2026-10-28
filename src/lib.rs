@@ -9,6 +9,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::slice;
 
+mod bytes;
 mod decode;
 mod encode;
 mod select;
@@ -172,21 +173,12 @@ pub fn decompress(src: &[u8]) -> Result<Vec<u8>> {
 /// [`decompress_len`] bytes long.
 #[inline]
 pub fn decompress_into<'a>(src: &[u8], dst: &'a mut [u8]) -> Result<&'a mut [u8]> {
-    let (len, header_len) = read_header(src)?;
-    if dst.len() < len {
-        return Err(Error::OutputTooSmall {
-            given: dst.len(),
-            min: len,
-        });
-    }
-    let dst = &mut dst[..len];
     // SAFETY: the decoder copies only bytes from `src`, from `dst` itself and
     // from initialized statics, so `dst` stays initialized.
-    let uninit = unsafe {
-        slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<u8>>(), len)
+    let dst = unsafe {
+        slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<u8>>(), dst.len())
     };
-    decode::decode_body(&src[header_len..], uninit)?;
-    Ok(dst)
+    decompress_into_uninit(src, dst)
 }
 
 /// Decompresses a raw Snappy block into `dst` without requiring zeroed output.
@@ -217,14 +209,14 @@ pub fn decompress_into_uninit<'a>(
 /// Unlike `vec![0; len]`, this avoids zero-filling the output before decode.
 #[inline]
 pub fn decompress_to_vec<'a>(src: &[u8], dst: &'a mut Vec<u8>) -> Result<&'a mut [u8]> {
-    let len = decompress_len(src)?;
+    let (len, header_len) = read_header(src)?;
     dst.clear();
     dst.try_reserve(len)
         .map_err(|_| Error::Allocation { requested: len })?;
-    decompress_into_uninit(src, &mut dst.spare_capacity_mut()[..len])?;
-    unsafe {
-        dst.set_len(len);
-    }
+    decode::decode_body(&src[header_len..], &mut dst.spare_capacity_mut()[..len])?;
+    // SAFETY: `decode_body` initialized the first `len` bytes of the spare
+    // capacity.
+    unsafe { dst.set_len(len) };
     Ok(dst.as_mut_slice())
 }
 
@@ -244,10 +236,7 @@ pub fn max_compress_len(input_len: usize) -> usize {
 /// Compresses bytes into a raw Snappy block.
 #[inline]
 pub fn compress(src: &[u8]) -> Result<Vec<u8>> {
-    let mut out = vec![0; max_compress_len(src.len())];
-    let len = compress_into(src, &mut out)?;
-    out.truncate(len);
-    Ok(out)
+    encode::compress_vec(src)
 }
 
 /// Compresses bytes into `dst` as a raw Snappy block.
@@ -328,7 +317,7 @@ pub mod read {
     use std::fmt;
     use std::io::{self, Read};
 
-    use crate::{Error, MAX_FRAME_BLOCK_LEN, decompress, decompress_len, frame};
+    use crate::{Error, MAX_FRAME_BLOCK_LEN, decompress_len, decompress_to_vec, frame};
 
     /// A reader that decodes the Snappy framed stream format.
     pub struct FrameDecoder<R: Read> {
@@ -453,7 +442,7 @@ pub mod read {
                         .into());
                     }
 
-                    self.dst = decompress(&self.src)?;
+                    decompress_to_vec(&self.src, &mut self.dst)?;
                     let expected = frame::read_u32_le(&checksum);
                     let got = frame::masked_crc32c(&self.dst);
                     if expected != got {
@@ -462,10 +451,7 @@ pub mod read {
                     self.pos = 0;
                     self.end = self.dst.len();
                 }
-                frame::PADDING_TYPE => {
-                    frame::skip_exact(&mut self.inner, len)?;
-                }
-                0x80..=0xfd => {
+                frame::PADDING_TYPE | 0x80..=0xfd => {
                     frame::skip_exact(&mut self.inner, len)?;
                 }
                 0x02..=0x7f => {
@@ -686,7 +672,7 @@ pub mod write {
                 }
 
                 let available = MAX_FRAME_BLOCK_LEN - self.src.len();
-                let take = cmp_len(buf.len(), available);
+                let take = buf.len().min(available);
                 self.src.extend_from_slice(&buf[..take]);
                 buf = &buf[take..];
 
@@ -722,11 +708,6 @@ pub mod write {
                 .field("wrote_stream_ident", &self.wrote_stream_ident)
                 .finish()
         }
-    }
-
-    #[inline]
-    fn cmp_len(left: usize, right: usize) -> usize {
-        if left < right { left } else { right }
     }
 }
 
@@ -837,34 +818,90 @@ mod frame {
         crc.rotate_right(15).wrapping_add(0xa282_ead8)
     }
 
+    /// CRC-32C (Castagnoli), eight bytes at a time ("slicing by 8").
     fn crc32c(src: &[u8]) -> u32 {
+        let table = &CRC32C_TABLES;
         let mut crc = !0u32;
-        for &byte in src {
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                let mask = 0u32.wrapping_sub(crc & 1);
-                crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
-            }
+        let mut chunks = src.chunks_exact(8);
+        for chunk in &mut chunks {
+            let low = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+            let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            crc = table[7][low as usize & 0xff]
+                ^ table[6][(low >> 8) as usize & 0xff]
+                ^ table[5][(low >> 16) as usize & 0xff]
+                ^ table[4][(low >> 24) as usize]
+                ^ table[3][high as usize & 0xff]
+                ^ table[2][(high >> 8) as usize & 0xff]
+                ^ table[1][(high >> 16) as usize & 0xff]
+                ^ table[0][(high >> 24) as usize];
+        }
+        for &byte in chunks.remainder() {
+            crc = (crc >> 8) ^ table[0][(crc as u8 ^ byte) as usize];
         }
         !crc
     }
+
+    /// `CRC32C_TABLES[k][b]` is the CRC of byte `b` followed by `k` zero
+    /// bytes, without the initial and final inversion.
+    static CRC32C_TABLES: [[u32; 256]; 8] = {
+        let mut tables = [[0u32; 256]; 8];
+        let mut i = 0;
+        while i < 256 {
+            let mut crc = i as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = (crc >> 1) ^ (0x82f6_3b78 & 0u32.wrapping_sub(crc & 1));
+                bit += 1;
+            }
+            tables[0][i] = crc;
+            i += 1;
+        }
+        let mut k = 1;
+        while k < 8 {
+            let mut i = 0;
+            while i < 256 {
+                let prev = tables[k - 1][i];
+                tables[k][i] = (prev >> 8) ^ tables[0][(prev & 0xff) as usize];
+                i += 1;
+            }
+            k += 1;
+        }
+        tables
+    };
+
+    #[cfg(test)]
+    #[test]
+    fn crc32c_check_value() {
+        // The standard check value, and lengths around the 8-byte step.
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+        let data: Vec<u8> = (0..100u32).map(|i| (i * 37 + 11) as u8).collect();
+        for len in 0..data.len() {
+            let mut bitwise = !0u32;
+            for &byte in &data[..len] {
+                bitwise ^= u32::from(byte);
+                for _ in 0..8 {
+                    bitwise =
+                        (bitwise >> 1) ^ (0x82f6_3b78 & 0u32.wrapping_sub(bitwise & 1));
+                }
+            }
+            assert_eq!(crc32c(&data[..len]), !bitwise, "len {len}");
+        }
+    }
 }
 
+/// Parses the varint decoded length at the start of a raw block, returning
+/// it and the length of the varint.
 #[inline(always)]
 fn read_header(src: &[u8]) -> Result<(usize, usize)> {
-    if src.is_empty() {
+    let Some(&first) = src.first() else {
         return Err(Error::Empty);
-    }
-
-    let first = src[0];
+    };
     if first < 0x80 {
         return Ok((usize::from(first), 1));
     }
-
-    let mut len = u64::from(first & 0x7f);
-    let mut shift = 7;
-    for (i, &byte) in src.iter().take(5).enumerate().skip(1) {
-        len |= u64::from(byte & 0x7f) << shift;
+    let mut len = 0u64;
+    for (i, &byte) in src.iter().take(5).enumerate() {
+        len |= u64::from(byte & 0x7f) << (7 * i);
         if byte < 0x80 {
             if len > MAX_BLOCK_LEN {
                 return Err(Error::TooBig {
@@ -874,7 +911,6 @@ fn read_header(src: &[u8]) -> Result<(usize, usize)> {
             }
             return Ok((len as usize, i + 1));
         }
-        shift += 7;
     }
     Err(Error::Header)
 }

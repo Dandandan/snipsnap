@@ -30,11 +30,11 @@ pub(crate) fn opaque(value: usize) -> usize {
 /// `if_zero` when `selector == 0` and `otherwise` if not, using a conditional
 /// move.
 ///
-/// The decoder's fast loop selects between literal and copy this way, and the
-/// encoder between copy encodings. Written as plain Rust, LLVM may turn such
-/// a select into a branch, which mispredicts on most real data, or (for the
-/// decoder's next tag) narrow it to a byte and re-extend it at the top of the
-/// loop, adding a cycle to the loop-carried dependency chain.
+/// The decoder's fast loop selects between literal and copy this way. Written
+/// as plain Rust, LLVM may turn such a select into a branch, which
+/// mispredicts on most real data, or (for the next tag) narrow it to a byte
+/// and re-extend it at the top of the loop, adding a cycle to the
+/// loop-carried dependency chain.
 macro_rules! select_if_zero {
     ($name:ident, $ty:ty) => {
         #[inline(always)]
@@ -86,3 +86,68 @@ macro_rules! select_if_zero {
 
 select_if_zero!(select_if_zero, usize);
 select_if_zero!(select_ptr_if_zero, *const u8);
+
+/// Returns `if_zero` if the low 32 bits of `xor` are zero, else `otherwise`.
+///
+/// The encoder's match search chooses this way between input words, by where
+/// two inputs first differ, which is hard to predict, so this uses a
+/// conditional move rather than a branch. On aarch64 the plain Rust version
+/// compiles to `csel`.
+#[inline(always)]
+pub(crate) fn select_if_low_zero(xor: u64, if_zero: u64, otherwise: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        let mut result = otherwise;
+        // SAFETY: register-only instructions without memory access.
+        unsafe {
+            std::arch::asm!(
+                "test {x:e}, {x:e}",
+                "cmovz {r}, {z}",
+                x = in(reg) xor,
+                z = in(reg) if_zero,
+                r = inout(reg) result,
+                options(pure, nomem, nostack),
+            );
+        }
+        result
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    {
+        if xor as u32 == 0 { if_zero } else { otherwise }
+    }
+}
+
+/// Returns `below` if `offset < 2048`, else `otherwise`, with a conditional
+/// move: the encoder's choice between copy encodings.
+#[inline(always)]
+pub(crate) fn select_if_below_2048(offset: u32, below: u32, otherwise: u32) -> u32 {
+    let mut result = below;
+    // SAFETY: (for both) register-only instructions without memory access.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    unsafe {
+        std::arch::asm!(
+            "cmp {o:e}, 2048",
+            "cmovae {r:e}, {x:e}",
+            o = in(reg) offset,
+            x = in(reg) otherwise,
+            r = inout(reg) result,
+            options(pure, nomem, nostack),
+        );
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    unsafe {
+        std::arch::asm!(
+            "cmp {o:w}, #2048",
+            "csel {r:w}, {r:w}, {x:w}, lo",
+            o = in(reg) offset,
+            x = in(reg) otherwise,
+            r = inout(reg) result,
+            options(pure, nomem, nostack),
+        );
+    }
+    #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
+    if offset >= 2048 {
+        result = otherwise;
+    }
+    result
+}

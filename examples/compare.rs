@@ -431,12 +431,7 @@ impl Runner {
         let outputs = out_lens.iter().map(|&n| vec![0u8; n]).collect();
         let uninit = out_lens
             .iter()
-            .map(|&n| {
-                let mut v = Vec::with_capacity(n);
-                // SAFETY: MaybeUninit<u8> needs no initialization.
-                unsafe { v.set_len(n) };
-                v
-            })
+            .map(|&n| vec![MaybeUninit::uninit(); n])
             .collect();
         Self {
             imp,
