@@ -3,9 +3,12 @@
 //! The decoder has two loops:
 //!
 //! * [`decode_fast`] handles the common tags (literals of up to 60 bytes and
-//!   copies with 1- or 2-byte offsets) without branching on the tag type. It
-//!   needs enough input and output slack that every tag can over-read and
-//!   over-write by a fixed amount, so it stops short of both buffer ends.
+//!   copies with 1- or 2-byte offsets) without branching on the tag type, and
+//!   does each element's copy while decoding the next one. It needs enough
+//!   input and output slack that every tag can over-read and over-write by a
+//!   fixed amount, so it stops short of both buffer ends; variants that need
+//!   less slack (one tag per limit check, then only short elements) take
+//!   over closer to the ends.
 //! * [`decode_one`] decodes a single tag with exact bounds checks. It handles
 //!   long literals, 4-byte-offset copies, malformed input, the last bytes of
 //!   each buffer and blocks too small for the fast loop.
@@ -32,17 +35,42 @@ const TAG_WRITE_SLOP: usize = 96;
 /// Bytes copied unconditionally per tag in the fast loop; longer elements
 /// take a second, rarely used branch.
 const FAST_COPY: usize = 32;
-/// Tags decoded per fast-loop limit check.
-const UNROLL: usize = 2;
-/// The fast loop runs while `ip < src.len() - INPUT_MARGIN`.
-const INPUT_MARGIN: usize = (UNROLL - 1) * 61 + TAG_READ_SLOP + 4;
-/// The fast loop runs while `op < dst.len() - OUTPUT_MARGIN`.
-const OUTPUT_MARGIN: usize = (UNROLL - 1) * 64 + TAG_WRITE_SLOP;
+/// The fast loop decoding `unroll` tags per limit check runs while
+/// `ip < src.len() - input_margin(unroll, wide)`; see [`decode_fast`] for
+/// `wide`.
+const fn input_margin(unroll: usize, wide: bool) -> usize {
+    if wide {
+        (unroll - 1) * 61 + TAG_READ_SLOP + 4
+    } else {
+        // The tag, a literal of up to `FAST_COPY` bytes and the next tag.
+        1 + FAST_COPY + 1 + 4
+    }
+}
+
+/// The fast loop decoding `unroll` tags per limit check runs while
+/// `op < dst.len() - output_margin(unroll, wide)`.
+const fn output_margin(unroll: usize, wide: bool) -> usize {
+    if wide {
+        (unroll - 1) * 64 + TAG_WRITE_SLOP
+    } else {
+        FAST_COPY
+    }
+}
+
+/// Why [`decode_fast`] returned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// It reached one of its limits.
+    Limit,
+    /// The next tag needs the careful path.
+    Tag,
+    /// The next tag starts a run of identical copies (see [`decode_run`]).
+    Run,
+}
 
 /// Lookup tables for the fast loop, indexed by tag and kept together so that
-/// one base register addresses all of them. The byte table comes first: on
-/// aarch64 a load can add an index register or an offset to the base, not
-/// both, and the other two tables share the scaled index anyway.
+/// one base register addresses both. The byte table comes first: on aarch64 a
+/// load can add an index register or an offset to the base, not both.
 #[repr(C, align(64))]
 struct Tables {
     /// Total encoded size of the element; only meaningful for fast-loop tags.
@@ -57,10 +85,13 @@ struct Tables {
     /// than 60 bytes and copies with 4-byte offsets) are `0xff`, which always
     /// looks like an overlapping copy and is then recognized by the high bit
     /// of its length.
-    len_minus_offset: [isize; 256],
-    /// Mask selecting the offset bytes that follow the tag.
-    offset_mask: [usize; 256],
+    len_minus_offset: [i16; 256],
 }
+
+/// Mask selecting the offset bytes that follow a tag, by tag type. Kept apart
+/// from (and smaller than) a per-tag table, as in the C++ library, which
+/// measured slightly faster.
+static OFFSET_MASK: [u32; 4] = [0, 0xff, 0xffff, 0];
 
 static TABLES: Tables = build_tables();
 
@@ -68,19 +99,17 @@ const fn build_tables() -> Tables {
     let mut tables = Tables {
         advance: [1; 256],
         len_minus_offset: [0; 256],
-        offset_mask: [0; 256],
     };
     let mut tag = 0usize;
     while tag < 256 {
         let data = (tag >> 2) as i16;
-        let (len, offset_high, mask, advance) = match tag & 3 {
-            0 if data < 60 => (data + 1, 1, 0, data + 2),
-            1 => ((data & 7) + 4, data >> 3, 0xff, 2),
-            2 => (data + 1, 0, 0xffff, 3),
-            _ => (0xff, 0, 0, 1),
+        let (len, offset_high, advance) = match tag & 3 {
+            0 if data < 60 => (data + 1, 1, data + 2),
+            1 => ((data & 7) + 4, data >> 3, 2),
+            2 => (data + 1, 0, 3),
+            _ => (0xff, 0, 1),
         };
-        tables.len_minus_offset[tag] = (len - (offset_high << 8)) as isize;
-        tables.offset_mask[tag] = mask as usize;
+        tables.len_minus_offset[tag] = len - (offset_high << 8);
         tables.advance[tag] = advance as u8;
         tag += 1;
     }
@@ -137,37 +166,67 @@ fn single_literal(src: &[u8], dst_len: usize) -> Option<&[u8]> {
 
 /// Decodes directly into `dst`, using the fast loop where both buffers have
 /// enough room left and the careful path near their ends.
+///
+/// The fast loop decodes two tags per limit check. Closer to the ends of the
+/// buffers it decodes one tag per check, and closer still only elements of
+/// up to `FAST_COPY` bytes that do not overlap their output. Each needs
+/// smaller margins than the one before, so fewer tags are left to the
+/// careful path, which matters for small blocks.
 #[inline(never)]
 fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     let src_len = src.len();
     let dst_len = dst.len();
+    let src_ptr = src.as_ptr();
     let dst_ptr = dst.as_mut_ptr().cast::<u8>();
-    let fast_ip_limit = src_len.saturating_sub(INPUT_MARGIN);
-    let fast_op_limit = dst_len.saturating_sub(OUTPUT_MARGIN);
+    let limits = |unroll, wide| {
+        (
+            src_len.saturating_sub(input_margin(unroll, wide)),
+            dst_len.saturating_sub(output_margin(unroll, wide)),
+        )
+    };
+    let (ip_limit_2, op_limit_2) = limits(2, true);
+    let (ip_limit_1, op_limit_1) = limits(1, true);
+    let (ip_limit_n, op_limit_n) = limits(1, false);
     let mut ip = 0usize;
     let mut op = 0usize;
 
     while ip < src_len {
-        if ip < fast_ip_limit && op < fast_op_limit {
-            // SAFETY: the limits leave `INPUT_MARGIN` bytes of `src` and
-            // `OUTPUT_MARGIN` bytes of `dst` after the starting positions.
-            let at_run;
-            (ip, op, at_run) = unsafe {
-                decode_fast(src.as_ptr(), ip, fast_ip_limit, dst_ptr, op, fast_op_limit)
-            };
-            if ip >= src_len {
-                break;
-            }
-            // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr` is valid
-            // for `dst_len` writes.
-            if at_run
-                && let Some(next) = unsafe { decode_run(src, ip, dst_ptr, dst_len, op) }
-            {
-                (ip, op) = next;
-                continue;
+        // SAFETY: (for all three calls) the limits leave the margins of the
+        // respective loop after the starting positions.
+        let fast = if ip < ip_limit_2 && op < op_limit_2 {
+            Some(unsafe {
+                decode_fast::<2, true>(src_ptr, ip, ip_limit_2, dst_ptr, op, op_limit_2)
+            })
+        } else if ip < ip_limit_1 && op < op_limit_1 {
+            Some(unsafe {
+                decode_fast::<1, true>(src_ptr, ip, ip_limit_1, dst_ptr, op, op_limit_1)
+            })
+        } else if ip < ip_limit_n && op < op_limit_n {
+            Some(unsafe {
+                decode_fast::<1, false>(src_ptr, ip, ip_limit_n, dst_ptr, op, op_limit_n)
+            })
+        } else {
+            None
+        };
+        if let Some((next_ip, next_op, stop)) = fast {
+            (ip, op) = (next_ip, next_op);
+            match stop {
+                Stop::Limit => continue,
+                Stop::Tag => {}
+                Stop::Run => {
+                    // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr`
+                    // is valid for `dst_len` writes.
+                    if let Some(next) =
+                        unsafe { decode_run(src, ip, dst_ptr, dst_len, op) }
+                    {
+                        (ip, op) = next;
+                        continue;
+                    }
+                }
             }
         }
-        // SAFETY: as above.
+        // SAFETY: `ip < src_len`, `op <= dst_len` and `dst_ptr` is valid for
+        // `dst_len` writes.
         (ip, op) = unsafe { decode_one(src, ip, dst_ptr, dst_len, op)? };
     }
 
@@ -180,25 +239,29 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     Ok(())
 }
 
-/// Decodes tags until `ip >= ip_limit`, `op >= op_limit` or a tag that needs
-/// the careful path. Returns the position of the first undecoded tag, the
-/// corresponding output position, and whether that tag starts a run of
-/// identical copies.
+/// Decodes tags, `UNROLL` (1 or 2) per limit check, until `ip >= ip_limit`,
+/// `op >= op_limit` or a tag that needs the careful path. Returns the
+/// position of the first undecoded tag, the corresponding output position,
+/// and why it stopped.
+///
+/// Unless `WIDE` is set, only elements of up to `FAST_COPY` bytes that do
+/// not overlap their own output are decoded, which keeps the margins small.
 ///
 /// # Safety
 ///
-/// `src` must be valid for reads of `ip_limit + INPUT_MARGIN` bytes and `dst`
-/// for writes of `op_limit + OUTPUT_MARGIN` bytes; `dst[..op]` must be
-/// initialized.
+/// `src` must be valid for reads of `ip_limit + input_margin(UNROLL, WIDE)`
+/// bytes and `dst` for writes of `op_limit + output_margin(UNROLL, WIDE)`
+/// bytes; `dst[..op]` must be initialized.
 #[inline(never)]
-unsafe fn decode_fast(
+unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     src: *const u8,
     ip: usize,
     ip_limit: usize,
     dst: *mut u8,
     op: usize,
     op_limit: usize,
-) -> (usize, usize, bool) {
+) -> (usize, usize, Stop) {
+    const { assert!(UNROLL == 1 || (UNROLL == 2 && WIDE)) };
     debug_assert!(ip < ip_limit && op < op_limit);
     // SAFETY: `ip < ip_limit` and `op < op_limit`, so all four are in bounds.
     // From here on `ip` points just past the tag being decoded. The output
@@ -213,10 +276,21 @@ unsafe fn decode_fast(
     };
     let mut tag = usize::from(unsafe { *ip.sub(1) });
     let tables = &TABLES;
-    let mut at_run = false;
+    let mut stop = Stop::Tag;
+    // Each element's copy is deferred to the next step: `pending_len` bytes
+    // from `pending_from` go to `out`, and the element being decoded starts
+    // after them. Doing the copy (and its rarely taken branch for more than
+    // `FAST_COPY` bytes) after the next element's tag has been worked out
+    // means that a mispredicted branch there does not throw away work on
+    // the tag-to-tag dependency chain. `NO_COPY` stands in when nothing is
+    // pending.
+    let mut pending_from = NO_COPY.as_ptr();
+    let mut pending_len = 0usize;
 
-    'outer: loop {
-        for _ in 0..UNROLL {
+    // One element. `break $exit` leaves the loop with `ip` just past the tag
+    // of the first element not decoded and the pending copy not yet done.
+    macro_rules! step {
+        ($exit:lifetime) => {{
             debug_assert!(tag < 256);
             let tag_type = tag & 3;
 
@@ -224,9 +298,16 @@ unsafe fn decode_fast(
             // keeps the select off the load-to-load dependency chain. The
             // volatile reads stop LLVM from turning this into one load from
             // a selected address.
-            // SAFETY: both are within `TAG_READ_SLOP` of the tag.
+            // SAFETY: both are within `TAG_READ_SLOP` of the tag, and in the
+            // narrow loop within `FAST_COPY + 2`: longer literals are left
+            // to the careful path, so their next tag is not needed.
+            let literal_len = if WIDE {
+                (tag >> 2) + 1
+            } else {
+                ((tag >> 2) + 1).min(FAST_COPY + 1)
+            };
             let next_literal =
-                usize::from(unsafe { ptr::read_volatile(ip.add((tag >> 2) + 1)) });
+                usize::from(unsafe { ptr::read_volatile(ip.add(literal_len)) });
             let next_copy = usize::from(unsafe { ptr::read_volatile(ip.add(tag_type)) });
             let next_tag = select_if_zero(tag_type, next_literal, next_copy);
 
@@ -236,8 +317,8 @@ unsafe fn decode_fast(
             // tag.
             let (entry, trailer, next_ip) = unsafe {
                 (
-                    *tables.len_minus_offset.get_unchecked(tag),
-                    read_u32_le(ip) as usize & *tables.offset_mask.get_unchecked(tag),
+                    isize::from(*tables.len_minus_offset.get_unchecked(tag)),
+                    (read_u32_le(ip) & *OFFSET_MASK.get_unchecked(tag_type)) as usize,
                     ip.add(usize::from(*tables.advance.get_unchecked(tag))),
                 )
             };
@@ -248,78 +329,119 @@ unsafe fn decode_fast(
             // `0..=0xffff`, so this cannot overflow; saying so lets LLVM
             // branch on the flags of the subtraction.
             let len_minus_offset = unsafe { entry.unchecked_sub(trailer as isize) };
+            // SAFETY: the pending copy is at most 64 bytes, within the
+            // output margin.
+            let element_out = unsafe { out.add(pending_len) };
+            // `element_out - offset`, which is before `dst` if the offset
+            // reaches before the start of the output. Literals have a
+            // spurious offset of 256 and copy from the input instead.
+            let match_from = element_out
+                .cast_const()
+                .wrapping_offset(len_minus_offset - len as isize);
+            if !WIDE && (len > FAST_COPY || len_minus_offset > 0) {
+                break $exit;
+            }
             if len_minus_offset > 0 {
                 cold();
                 if len & 0x80 != 0 {
                     // Long literal or 4-byte offset copy.
-                    break 'outer;
+                    break $exit;
                 }
                 // Overlapping copy, or a copy with offset zero.
                 let offset = (len as isize - len_minus_offset) as usize;
-                // SAFETY: `out` was derived from `dst`.
-                let op = unsafe { out.offset_from(dst) } as usize;
+                // SAFETY: `element_out` was derived from `dst`.
+                let op = unsafe { element_out.offset_from(dst) } as usize;
                 if offset == 0 || offset > op || (offset < 8 && op < 8) {
-                    break 'outer;
+                    break $exit;
                 }
                 // SAFETY: the next element is within the input margin.
-                if unsafe { next_is_same(ip, next_ip) } {
+                if unsafe { next_is_same(ip, next_ip, tag_type) } {
                     // A run of identical copies; see `decode_run`.
-                    at_run = true;
-                    break 'outer;
+                    stop = Stop::Run;
+                    break $exit;
                 }
+                // The pattern comes from the bytes before this element. If
+                // the pending element holds all of them, they are read from
+                // its source, so that the pattern does not wait for the
+                // pending copy's stores.
                 // SAFETY: `1 <= offset < len <= 64`, `offset <= op` and the
-                // output margin covers the pattern overshoot.
-                unsafe { copy_overlapping(out, offset, len) };
+                // output margin covers the pending copy and the pattern
+                // overshoot. The pending source holds the same bytes as the
+                // output it is copied to.
+                unsafe {
+                    let before = if pending_len >= offset.max(8) {
+                        pending_from.add(pending_len)
+                    } else {
+                        element_out.cast_const()
+                    };
+                    copy_pending(pending_from, out, pending_len);
+                    copy_overlapping(before, element_out, offset, len);
+                    out = element_out.add(len);
+                }
+                pending_from = NO_COPY.as_ptr();
+                pending_len = 0;
             } else {
-                // `out - offset`, which is before `dst` if the offset reaches
-                // before the start of the output. Literals have a spurious
-                // offset of 256 and copy from the input instead.
-                let match_from = out
-                    .cast_const()
-                    .wrapping_offset(len_minus_offset - len as isize);
                 if (match_from as usize) < (dst as usize) {
                     cold();
                     if tag_type != 0 {
-                        break 'outer;
+                        break $exit;
                     }
                 }
                 let from = select_ptr_if_zero(tag_type, ip, match_from);
-                // SAFETY: `from` is either the literal (within the input
-                // margin) or at least `len` bytes before `out`; the extra
-                // bytes are within the slop on both sides. `ptr::copy`
-                // (memmove semantics) copies bytes untyped, so stale output
-                // bytes past `out` are never read as integers.
+                // SAFETY: the pending copy is within the margins (see
+                // `copy_pending`).
                 unsafe {
-                    ptr::copy(from, out, FAST_COPY);
-                    if len > FAST_COPY {
+                    ptr::copy(pending_from, out, FAST_COPY);
+                    if WIDE && pending_len > FAST_COPY {
                         cold();
-                        // Runs of non-overlapping copies are runs of
-                        // 64-byte copies, the longest a tag can encode.
+                        // Only a copy-2 tag of 64 bytes (`0xfe`) is longer
+                        // than any literal here. If this element repeats it,
+                        // the two start a run of identical copies, as found
+                        // in data with periods of 64 to `MAX_RUN_PERIOD`
+                        // bytes; see `decode_run`, which takes over at the
+                        // pending element.
                         if tag == 0xfe
-                            && (len as isize - len_minus_offset) as usize
-                                <= MAX_RUN_PERIOD
-                            && next_is_same(ip, next_ip)
+                            && pending_len == 64
+                            && out.addr() - pending_from.addr() <= MAX_RUN_PERIOD
+                            && next_is_same(ip.sub(3), ip, 2)
                         {
-                            // A run of identical copies; see `decode_run`.
-                            at_run = true;
-                            break 'outer;
+                            stop = Stop::Run;
+                            ip = ip.sub(3);
+                            pending_from = NO_COPY.as_ptr();
+                            pending_len = 0;
+                            break $exit;
                         }
                         ptr::copy(
-                            from.add(FAST_COPY),
+                            pending_from.add(FAST_COPY),
                             out.add(FAST_COPY),
                             64 - FAST_COPY,
                         );
                     }
                 }
+                out = element_out;
+                pending_from = from;
+                pending_len = len;
             }
-            // SAFETY: `len <= 64`, within the output margin.
-            out = unsafe { out.add(len) };
             ip = next_ip;
             tag = next_tag;
+        }};
+    }
+
+    'outer: loop {
+        step!('outer);
+        if UNROLL == 2 {
+            step!('outer);
         }
-        if ip >= ip_limit || out >= out_limit {
+        // SAFETY: as for `element_out`.
+        if ip >= ip_limit || unsafe { out.add(pending_len) } >= out_limit {
+            stop = Stop::Limit;
             break;
         }
+    }
+    // SAFETY: as in the loop.
+    unsafe {
+        copy_pending(pending_from, out, pending_len);
+        out = out.add(pending_len);
     }
 
     // SAFETY: `ip` and `out` were derived from `src` and `dst`; `ip` points
@@ -328,8 +450,31 @@ unsafe fn decode_fast(
         (
             ip.offset_from(src) as usize - 1,
             out.offset_from(dst) as usize,
-            at_run,
+            stop,
         )
+    }
+}
+
+/// Source of the fast loop's deferred copy when no element is pending.
+static NO_COPY: [u8; FAST_COPY] = [0; FAST_COPY];
+
+/// Copies the element deferred by the fast loop: `len <= 64` bytes from
+/// `from` to `to`, writing `FAST_COPY` or 64 bytes.
+///
+/// # Safety
+///
+/// `from` is either a literal within the input margin, at least `len` bytes
+/// before `to` in the output, or `NO_COPY` with `len == 0`; `to` has 64
+/// bytes of room. `ptr::copy` (memmove semantics) copies bytes untyped, so
+/// stale output bytes past `to` are never read as integers.
+#[inline(always)]
+unsafe fn copy_pending(from: *const u8, to: *mut u8, len: usize) {
+    unsafe {
+        ptr::copy(from, to, FAST_COPY);
+        if len > FAST_COPY {
+            cold();
+            ptr::copy(from.add(FAST_COPY), to.add(FAST_COPY), 64 - FAST_COPY);
+        }
     }
 }
 
@@ -337,17 +482,20 @@ unsafe fn decode_fast(
 /// [`fill_periodic`] writes past the end of a run.
 const MAX_RUN_PERIOD: usize = 112;
 
-/// Whether the element after the one whose tag is at `ip - 1` is identical
-/// to it; `next_ip` is just past the next element's tag.
+/// Whether the copy whose tag (of type `tag_type`) is at `ip - 1` is
+/// followed by an identical one; `next_ip` is just past the next element's
+/// tag.
+///
+/// The size is taken from the tag type rather than from `next_ip`, so that
+/// the fast loop need not keep the element size around for this rare check.
 ///
 /// # Safety
 ///
 /// Both elements must be readable, plus 4 bytes past the second tag.
 #[inline(always)]
-unsafe fn next_is_same(ip: *const u8, next_ip: *const u8) -> bool {
+unsafe fn next_is_same(ip: *const u8, next_ip: *const u8, tag_type: usize) -> bool {
     unsafe {
-        let size = next_ip.offset_from(ip) as usize;
-        let mask = if size == 2 { 0xffff } else { 0xff_ffff };
+        let mask = if tag_type == 1 { 0xffff } else { 0xff_ffff };
         (read_u32_le(ip.sub(1)) ^ read_u32_le(next_ip.sub(1))) & mask == 0
     }
 }
@@ -435,7 +583,7 @@ unsafe fn fill_periodic(start: *mut u8, offset: usize, total: usize) {
         } else {
             // Write a first block of whole periods, then copy that.
             let block = offset * 48usize.div_ceil(offset);
-            copy_overlapping(start, offset, block);
+            copy_overlapping(start, start, offset, block);
             (start.cast_const(), block, block)
         };
         while pos < total {
@@ -611,7 +759,7 @@ unsafe fn copy_match(
         } else if offset < 8 {
             copy_short_pattern(to, offset, len, op);
         } else if dst_remaining >= TAG_WRITE_SLOP {
-            copy_overlapping(to, offset, len);
+            copy_overlapping(to, to, offset, len);
         } else {
             for i in 0..len {
                 *to.add(i) = *from.add(i);
@@ -714,24 +862,27 @@ static REPEAT_MUL: [u64; 8] = {
 /// Largest multiple of the offset that is at most 8, indexed by offset.
 static REPEAT_STRIDE: [usize; 8] = [8, 8, 8, 6, 8, 5, 6, 7];
 
-/// Writes `len` bytes repeating the `offset` bytes before `dst`, in whole
-/// periods: up to 95 bytes in total (for an offset just below 64).
+/// Writes `len` bytes at `dst` repeating the `offset` bytes before it, in
+/// whole periods: up to 95 bytes in total (for an offset just below 64).
+/// The bytes before `dst` are read before `before` instead, which is `dst`
+/// itself or a copy of the same bytes.
 ///
-/// Every source byte is loaded from before `dst` before anything is stored,
-/// so the copy neither reads stale output nor stalls on store forwarding.
+/// Every source byte is loaded before anything is stored, so the copy
+/// neither reads stale output nor stalls on store forwarding.
 ///
 /// # Safety
 ///
-/// `1 <= offset < len <= 64`; `max(offset, 8)` bytes before `dst` must be
-/// initialized and `TAG_WRITE_SLOP` bytes from `dst` valid for writes.
+/// `1 <= offset < len <= 64`; `max(offset, 8)` bytes before `before` must be
+/// initialized, equal to those before `dst`, and `TAG_WRITE_SLOP` bytes from
+/// `dst` valid for writes.
 #[inline(always)]
-unsafe fn copy_overlapping(dst: *mut u8, offset: usize, len: usize) {
+unsafe fn copy_overlapping(before: *const u8, dst: *mut u8, offset: usize, len: usize) {
     debug_assert!(offset >= 1 && offset < len && len <= 64);
     unsafe {
         if offset < 8 {
             // Build eight bytes of the pattern from the last eight output
             // bytes, then store it at a stride that keeps the phase.
-            let tail = read_u64_le(dst.sub(8));
+            let tail = read_u64_le(before.sub(8));
             let pattern = (tail >> (8 * (8 - offset))).wrapping_mul(REPEAT_MUL[offset]);
             let stride = REPEAT_STRIDE[offset];
             let mut i = 0;
@@ -743,8 +894,8 @@ unsafe fn copy_overlapping(dst: *mut u8, offset: usize, len: usize) {
                 }
             }
         } else if offset < 16 {
-            let head = read_u64_le(dst.sub(offset));
-            let tail = read_u64_le(dst.sub(8));
+            let head = read_u64_le(before.sub(offset));
+            let tail = read_u64_le(before.sub(8));
             let mut i = 0;
             loop {
                 write_u64_le(dst.add(i), head);
@@ -755,8 +906,8 @@ unsafe fn copy_overlapping(dst: *mut u8, offset: usize, len: usize) {
                 }
             }
         } else if offset < 32 {
-            let head = read_16(dst.sub(offset));
-            let tail = read_16(dst.sub(16));
+            let head = read_16(before.sub(offset));
+            let tail = read_16(before.sub(16));
             let mut i = 0;
             loop {
                 write_16(dst.add(i), head);
@@ -768,8 +919,8 @@ unsafe fn copy_overlapping(dst: *mut u8, offset: usize, len: usize) {
             }
         } else {
             // 32 <= offset < len <= 64: two periods at most.
-            let head = read_32(dst.sub(offset));
-            let tail = read_32(dst.sub(32));
+            let head = read_32(before.sub(offset));
+            let tail = read_32(before.sub(32));
             write_32(dst, head);
             write_32(dst.add(offset - 32), tail);
             write_32(dst.add(offset), head);

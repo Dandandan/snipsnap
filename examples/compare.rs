@@ -303,12 +303,10 @@ fn parquet_pages(path: &str) -> Option<Vec<Vec<u8>>> {
                     && header.data_page_header_v2.is_none()
                     && header.compressed_page_size > 0
                     && end <= chunk.len()
-                {
-                    if let Ok(page) =
+                    && let Ok(page) =
                         snap::raw::Decoder::new().decompress_vec(&chunk[offset..end])
-                    {
-                        pages.push(page);
-                    }
+                {
+                    pages.push(page);
                 }
                 offset = end;
             }
