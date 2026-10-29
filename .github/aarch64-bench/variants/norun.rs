@@ -22,8 +22,8 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use crate::bytes::{
-    copy_16_to_128, copy_exact, copy_short, read_32, read_u32, read_u64, write_16,
-    write_32, write_u16, write_u32, write_u64,
+    copy_16_to_128, copy_exact, copy_short, read_32, read_u16, read_u32, read_u64,
+    write_16, write_32, write_u16, write_u32, write_u64,
 };
 use crate::select::{opaque, select_if_zero, select_ptr_if_zero};
 use crate::{Error, Result, decode_error};
@@ -79,15 +79,15 @@ struct Tables {
     /// looks like an overlapping copy and is then recognized by the high bit
     /// of its length.
     len_minus_offset: [i16; 256],
-    /// [`OFFSET_MASK`], here so that on x86-64 the same base register
-    /// addresses it, rather than an address recomputed for every tag.
+    /// Mask selecting the offset bytes that follow a tag, by tag type. Only
+    /// x86-64 reads it (see [`OFFSET_MASKS`]).
     offset_mask: [u32; 4],
 }
 
-/// Mask selecting the offset bytes that follow a tag, by tag type. aarch64
-/// uses this copy, whose address stays in a register: one in [`Tables`]
-/// would need an instruction to add its offset.
-static OFFSET_MASK: [u32; 4] = [0, 0xff, 0xffff, 0];
+/// The masks of [`Tables::offset_mask`], 16 bits each, which other targets
+/// shift into place instead of loading: on aarch64 a load cannot add both
+/// the table's offset and an index to the base register.
+const OFFSET_MASKS: u64 = 0xffff_00ff_0000;
 
 static TABLES: Tables = build_tables();
 
@@ -95,7 +95,7 @@ const fn build_tables() -> Tables {
     let mut tables = Tables {
         advance: [1; 256],
         len_minus_offset: [0; 256],
-        offset_mask: OFFSET_MASK,
+        offset_mask: [0, 0xff, 0xffff, 0],
     };
     let mut tag = 0usize;
     while tag < 256 {
@@ -300,15 +300,16 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     };
     let mut tag = usize::from(unsafe { *ip.sub(1) });
     let tables = &TABLES;
-    let offset_mask = if cfg!(target_arch = "x86_64") {
-        &tables.offset_mask
-    } else {
-        &OFFSET_MASK
-    };
+    // On x86-64 one base register addresses both tables. Elsewhere this
+    // one gets a register of its own, which saves adding its offset to the
+    // base for every tag.
     let len_minus_offset: &[i16; 256] = if cfg!(target_arch = "x86_64") {
         &tables.len_minus_offset
     } else {
-        unsafe { &*(opaque(tables.len_minus_offset.as_ptr() as usize) as *const [i16; 256]) }
+        // SAFETY: `opaque` returns the address it is given.
+        unsafe {
+            &*(opaque(tables.len_minus_offset.as_ptr() as usize) as *const [i16; 256])
+        }
     };
     // Each element's copy is deferred to the next step: `pending_len` bytes
     // from `pending_from` go to `out`, and the element being decoded starts
@@ -333,18 +334,19 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
 
             // SAFETY: `tag` is a byte (`next_tag` hides that from LLVM), and
             // the reads are within `TAG_READ_SLOP` of the tag. The advance is
-            // only used once the tag is known to be a fast-loop tag. The narrow loop's margin does not cover the advance of a
-            // literal it leaves to the careful path, hence the wrapping add.
+            // only used once the tag is known to be a fast-loop tag. The
+            // narrow loop's margin does not cover the advance of a literal it
+            // leaves to the careful path, hence the wrapping add.
             let (entry, trailer, next_ip) = unsafe {
                 let advance = usize::from(*tables.advance.get_unchecked(tag));
                 (
                     isize::from(*len_minus_offset.get_unchecked(tag)),
-                    if cfg!(target_arch = "aarch64") {
-                        let mask = 0xffff_00ff_0000u64 >> (16 * tag_type);
-                        (u64::from(u16::from_le(ptr::read_unaligned(ip.cast::<u16>())))
-                            & mask) as usize
+                    if cfg!(target_arch = "x86_64") {
+                        (read_u32(ip) & *tables.offset_mask.get_unchecked(tag_type))
+                            as usize
                     } else {
-                        (read_u32(ip) & *offset_mask.get_unchecked(tag_type)) as usize
+                        let mask = OFFSET_MASKS >> (16 * tag_type);
+                        (u64::from(read_u16(ip)) & mask) as usize
                     },
                     if WIDE {
                         ip.add(advance)
@@ -440,11 +442,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                         // titles and URLs, are 64-byte copies one after the
                         // other at longer periods, where testing the tag
                         // first measured slower.
-                        if out.addr().wrapping_sub(pending_from.addr()) <= MAX_RUN_PERIOD
-                            && tag == 0xfe
-                            && pending_len == 64
-                            && next_is_same(ip.sub(3), ip, 2)
-                        {
+                        if false {
                             ip = ip.sub(3);
                             pending_from = NO_COPY.as_ptr();
                             pending_len = 0;
