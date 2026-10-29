@@ -48,9 +48,9 @@ fn count_tags(body: &[u8]) -> usize {
 fn calib() -> u64 {
     let mut x: u64 = 1;
     #[cfg(target_arch = "x86_64")]
-    unsafe { std::arch::asm!("mov {n}, 100000", "2:", "add {x}, {y}", "add {x}, {y}", "add {x}, {y}", "dec {n}", "jnz 2b", x = inout(reg) x, y = in(reg) 3u64, n = out(reg) _); }
+    unsafe { std::arch::asm!("2:", "add {x}, {y}", "add {x}, {y}", "add {x}, {y}", "dec {n}", "jnz 2b", x = inout(reg) x, y = in(reg) 3u64, n = inout(reg) 100000u64 => _); }
     #[cfg(target_arch = "aarch64")]
-    unsafe { std::arch::asm!("mov {n}, #100000", "2:", "add {x}, {x}, {y}", "add {x}, {x}, {y}", "add {x}, {x}, {y}", "subs {n}, {n}, #1", "b.ne 2b", x = inout(reg) x, y = in(reg) 3u64, n = out(reg) _); }
+    unsafe { std::arch::asm!("2:", "add {x}, {x}, {y}", "add {x}, {x}, {y}", "add {x}, {x}, {y}", "subs {n}, {n}, #1", "b.ne 2b", x = inout(reg) x, y = in(reg) 3u64, n = inout(reg) 100000u64 => _); }
     x
 }
 #[cfg(target_arch = "x86_64")]
@@ -200,7 +200,7 @@ fn main() {
         let tags = count_tags(&comp[h..]);
         if std::env::var("STATS").is_ok() {
             let body = &comp[h..];
-            let (mut ip, mut long, mut ovl, mut lit, mut c1) = (0, 0, 0, 0, 0);
+            let (mut ip, mut long, mut ovl, mut lit, mut _c1) = (0, 0, 0, 0, 0);
             let mut runs = 0; let mut prev_long = false; let mut flips = 0;
             while ip < body.len() {
                 let tag = body[ip] as usize;
@@ -210,7 +210,7 @@ fn main() {
                     2 => ((tag >> 2) + 1, body[ip+1] as usize | (body[ip+2] as usize) << 8, 3),
                     _ => ((tag >> 2) + 1, 1 << 20, 5),
                 };
-                if tag & 3 == 0 { lit += 1 } else if tag & 3 == 1 { c1 += 1 }
+                if tag & 3 == 0 { lit += 1 } else if tag & 3 == 1 { _c1 += 1 }
                 let is_long = len > 32;
                 if is_long { long += 1 }
                 if is_long != prev_long { flips += 1 }
