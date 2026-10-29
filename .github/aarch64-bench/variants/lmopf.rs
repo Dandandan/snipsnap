@@ -305,6 +305,13 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     } else {
         &OFFSET_MASK
     };
+    // On aarch64, a register of its own for this table saves adding its
+    // offset to the base for every tag.
+    let len_minus_offset: &[i16; 256] = if cfg!(target_arch = "x86_64") {
+        &tables.len_minus_offset
+    } else {
+        unsafe { &*(opaque(tables.len_minus_offset.as_ptr() as usize) as *const [i16; 256]) }
+    };
     // Each element's copy is deferred to the next step: `pending_len` bytes
     // from `pending_from` go to `out`, and the element being decoded starts
     // after them. Doing the copy (and its rarely taken branch for more than
@@ -324,7 +331,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             // `TAG_READ_SLOP` of the tag, and in the narrow loop within
             // `FAST_COPY + 2`: longer literals are left to the careful path,
             // so their next tag is not needed.
-            let (tag_type, next_tag, selected_next_ip) = unsafe { next_tag::<WIDE>(ip, tag) };
+            let (tag_type, next_tag) = unsafe { next_tag::<WIDE>(ip, tag) };
 
             // SAFETY: `tag` is a byte (`next_tag` hides that from LLVM), and
             // the reads are within `TAG_READ_SLOP` of the tag. The advance is
@@ -333,11 +340,9 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             let (entry, trailer, next_ip) = unsafe {
                 let advance = usize::from(*tables.advance.get_unchecked(tag));
                 (
-                    isize::from(*tables.len_minus_offset.get_unchecked(tag)),
+                    isize::from(*len_minus_offset.get_unchecked(tag)),
                     (read_u32(ip) & *offset_mask.get_unchecked(tag_type)) as usize,
-                    if let Some(next_ip) = selected_next_ip {
-                        next_ip
-                    } else if WIDE {
+                    if WIDE {
                         ip.add(advance)
                     } else {
                         ip.wrapping_add(advance)
@@ -459,6 +464,10 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
 
     'outer: loop {
         align_32::<UNROLL>();
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}, #128]", in(reg) ip, options(nostack, preserves_flags, readonly));
+        }
         step!('outer);
         if UNROLL == 2 {
             align_32::<UNROLL>();
@@ -504,10 +513,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
 /// Both candidates must be readable. Unless `WIDE`, the literal candidate is
 /// capped at `ip + FAST_COPY + 1`.
 #[inline(always)]
-unsafe fn next_tag<const WIDE: bool>(
-    ip: *const u8,
-    tag: usize,
-) -> (usize, usize, Option<*const u8>) {
+unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize) {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     if WIDE {
         let (tag_type, next_tag);
@@ -528,7 +534,7 @@ unsafe fn next_tag<const WIDE: bool>(
                 options(pure, readonly, nostack),
             );
         }
-        return (tag_type, next_tag, None);
+        return (tag_type, next_tag);
     }
     let tag_type = tag & 3;
     let literal_len = if WIDE {
@@ -536,23 +542,12 @@ unsafe fn next_tag<const WIDE: bool>(
     } else {
         ((tag >> 2) + 1).min(FAST_COPY + 1)
     };
-    if cfg!(target_arch = "aarch64") {
-        // Select the address, load once; the next element starts after it.
-        let at = select_ptr_if_zero(
-            tag_type,
-            ip.wrapping_add(literal_len),
-            ip.wrapping_add(tag_type),
-        );
-        // SAFETY: as documented above.
-        let next = usize::from(unsafe { *at });
-        return (tag_type, next, Some(at.wrapping_add(1)));
-    }
     // The volatile reads stop LLVM from turning this into one load from a
     // selected address.
     // SAFETY: as documented above.
     let next_literal = usize::from(unsafe { ptr::read_volatile(ip.add(literal_len)) });
     let next_copy = usize::from(unsafe { ptr::read_volatile(ip.add(tag_type)) });
-    (tag_type, select_if_zero(tag_type, next_literal, next_copy), None)
+    (tag_type, select_if_zero(tag_type, next_literal, next_copy))
 }
 
 /// Aligns the start of the calling function to 64 bytes (on x86-64), so that
