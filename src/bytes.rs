@@ -7,6 +7,11 @@
 use std::ptr;
 
 #[inline(always)]
+pub(crate) unsafe fn read_u16(ptr: *const u8) -> u16 {
+    u16::from_le(unsafe { ptr::read_unaligned(ptr.cast::<u16>()) })
+}
+
+#[inline(always)]
 pub(crate) unsafe fn read_u32(ptr: *const u8) -> u32 {
     u32::from_le(unsafe { ptr::read_unaligned(ptr.cast::<u32>()) })
 }
