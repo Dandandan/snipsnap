@@ -317,7 +317,10 @@ pub mod read {
     use std::fmt;
     use std::io::{self, Read};
 
-    use crate::{Error, MAX_FRAME_BLOCK_LEN, decompress_len, decompress_to_vec, frame};
+    use crate::{
+        Error, MAX_FRAME_BLOCK_LEN, decompress_into, decompress_len, decompress_to_vec,
+        frame,
+    };
 
     /// A reader that decodes the Snappy framed stream format.
     pub struct FrameDecoder<R: Read> {
@@ -357,10 +360,12 @@ pub mod read {
             self.inner
         }
 
-        fn read_chunk(&mut self) -> io::Result<bool> {
+        /// Reads the next chunk. Its data goes straight to `buf` if it fits,
+        /// which saves copying it from `dst` afterwards.
+        fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<Chunk> {
             let mut header = [0u8; 4];
             if !frame::read_exact_eof(&mut self.inner, &mut header)? {
-                return Ok(false);
+                return Ok(Chunk::End);
             }
 
             let chunk_type = header[0];
@@ -407,14 +412,15 @@ pub mod read {
 
                     let mut checksum = [0u8; frame::CHECKSUM_LEN];
                     self.inner.read_exact(&mut checksum)?;
+                    let expected = frame::read_u32_le(&checksum);
+                    if let Some(out) = buf.get_mut(..data_len) {
+                        self.inner.read_exact(out)?;
+                        frame::check_crc(expected, out)?;
+                        return Ok(Chunk::Direct(data_len));
+                    }
                     self.dst.resize(data_len, 0);
                     self.inner.read_exact(&mut self.dst)?;
-
-                    let expected = frame::read_u32_le(&checksum);
-                    let got = frame::masked_crc32c(&self.dst);
-                    if expected != got {
-                        return Err(Error::Checksum { expected, got }.into());
-                    }
+                    frame::check_crc(expected, &self.dst)?;
                     self.pos = 0;
                     self.end = data_len;
                 }
@@ -442,12 +448,14 @@ pub mod read {
                         .into());
                     }
 
-                    decompress_to_vec(&self.src, &mut self.dst)?;
                     let expected = frame::read_u32_le(&checksum);
-                    let got = frame::masked_crc32c(&self.dst);
-                    if expected != got {
-                        return Err(Error::Checksum { expected, got }.into());
+                    if let Some(out) = buf.get_mut(..decoded_len) {
+                        decompress_into(&self.src, out)?;
+                        frame::check_crc(expected, out)?;
+                        return Ok(Chunk::Direct(decoded_len));
                     }
+                    decompress_to_vec(&self.src, &mut self.dst)?;
+                    frame::check_crc(expected, &self.dst)?;
                     self.pos = 0;
                     self.end = self.dst.len();
                 }
@@ -459,8 +467,18 @@ pub mod read {
                 }
             }
 
-            Ok(true)
+            Ok(Chunk::Buffered)
         }
+    }
+
+    /// What [`FrameDecoder::read_chunk`] did with a chunk.
+    enum Chunk {
+        /// The stream ended.
+        End,
+        /// Any data is in `dst[pos..end]`.
+        Buffered,
+        /// This many bytes went to the caller's buffer.
+        Direct(usize),
     }
 
     impl<R: Read> Read for FrameDecoder<R> {
@@ -477,8 +495,10 @@ pub mod read {
                     return Ok(len);
                 }
 
-                if !self.read_chunk()? {
-                    return Ok(0);
+                match self.read_chunk(buf)? {
+                    Chunk::End => return Ok(0),
+                    Chunk::Buffered | Chunk::Direct(0) => {}
+                    Chunk::Direct(len) => return Ok(len),
                 }
             }
         }
@@ -813,13 +833,175 @@ mod frame {
         Ok(())
     }
 
+    /// Checks a chunk's data against the masked CRC from its header.
+    pub fn check_crc(expected: u32, data: &[u8]) -> io::Result<()> {
+        let got = masked_crc32c(data);
+        if expected == got {
+            Ok(())
+        } else {
+            Err(super::Error::Checksum { expected, got }.into())
+        }
+    }
+
     pub fn masked_crc32c(src: &[u8]) -> u32 {
         let crc = crc32c(src);
         crc.rotate_right(15).wrapping_add(0xa282_ead8)
     }
 
-    /// CRC-32C (Castagnoli), eight bytes at a time ("slicing by 8").
+    /// CRC-32C (Castagnoli), with the CPU's CRC-32C instructions where it has
+    /// them (SSE4.2 on x86-64, the CRC extension on aarch64).
     fn crc32c(src: &[u8]) -> u32 {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        if std::arch::is_x86_feature_detected!("sse4.2") {
+            // SAFETY: the CPU supports SSE4.2.
+            return unsafe { crc32c_sse42(src) };
+        }
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            // SAFETY: the CPU supports the CRC extension.
+            return unsafe { crc32c_arm(src) };
+        }
+        crc32c_tables(src)
+    }
+
+    /// The CRC-32C instructions' throughput is a third of their latency, so
+    /// long inputs are split into three streams, whose CRCs are combined by
+    /// shifting them over the bytes that follow (Mark Adler's method). `$crc8`
+    /// and `$crc1` are the 8-byte and 1-byte instructions.
+    macro_rules! crc32c_hw {
+        ($src:expr, $crc8:path, $crc1:path) => {{
+            let mut src: &[u8] = $src;
+            let mut crc = !0u32;
+            for (block, shift) in [(LONG, &CRC32C_LONG), (SHORT, &CRC32C_SHORT)] {
+                while src.len() >= 3 * block {
+                    let (a, rest) = src.split_at(block);
+                    let (b, rest) = rest.split_at(block);
+                    let (c, rest) = rest.split_at(block);
+                    let (mut crc1, mut crc2) = (0, 0);
+                    for ((a, b), c) in a
+                        .chunks_exact(8)
+                        .zip(b.chunks_exact(8))
+                        .zip(c.chunks_exact(8))
+                    {
+                        crc = $crc8(crc, u64_le(a));
+                        crc1 = $crc8(crc1, u64_le(b));
+                        crc2 = $crc8(crc2, u64_le(c));
+                    }
+                    crc = crc32c_shift(shift, crc) ^ crc1;
+                    crc = crc32c_shift(shift, crc) ^ crc2;
+                    src = rest;
+                }
+            }
+            let mut chunks = src.chunks_exact(8);
+            for chunk in &mut chunks {
+                crc = $crc8(crc, u64_le(chunk));
+            }
+            for &byte in chunks.remainder() {
+                crc = $crc1(crc, byte);
+            }
+            !crc
+        }};
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    #[target_feature(enable = "sse4.2")]
+    fn crc32c_sse42(src: &[u8]) -> u32 {
+        use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+        // The 64-bit instruction takes and returns the CRC in a 64-bit
+        // register.
+        #[target_feature(enable = "sse4.2")]
+        fn crc8(crc: u32, data: u64) -> u32 {
+            _mm_crc32_u64(u64::from(crc), data) as u32
+        }
+        crc32c_hw!(src, crc8, _mm_crc32_u8)
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    #[target_feature(enable = "crc")]
+    fn crc32c_arm(src: &[u8]) -> u32 {
+        use std::arch::aarch64::{__crc32cb, __crc32cd};
+        crc32c_hw!(src, __crc32cd, __crc32cb)
+    }
+
+    #[inline(always)]
+    fn u64_le(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    /// Lengths of the blocks that `crc32c_hw!` processes three at a time.
+    const LONG: usize = 8192;
+    const SHORT: usize = 256;
+
+    /// Tables that shift a CRC over `LONG` and `SHORT` zero bytes.
+    static CRC32C_LONG: [[u32; 256]; 4] = crc32c_zeros(LONG);
+    static CRC32C_SHORT: [[u32; 256]; 4] = crc32c_zeros(SHORT);
+
+    /// Shifts the CRC register `crc` over the zero bytes `zeros` was built
+    /// for.
+    #[inline(always)]
+    fn crc32c_shift(zeros: &[[u32; 256]; 4], crc: u32) -> u32 {
+        zeros[0][crc as usize & 0xff]
+            ^ zeros[1][(crc >> 8) as usize & 0xff]
+            ^ zeros[2][(crc >> 16) as usize & 0xff]
+            ^ zeros[3][(crc >> 24) as usize]
+    }
+
+    /// The tables for `crc32c_shift` over `len` zero bytes, a power of two:
+    /// the operator, a 32x32 matrix over GF(2), applied to each byte of the
+    /// CRC.
+    const fn crc32c_zeros(len: usize) -> [[u32; 256]; 4] {
+        // The operator for one zero bit, then squared up to `len` bytes.
+        let mut op = [0u32; 32];
+        op[0] = 0x82f6_3b78;
+        let mut n = 1;
+        while n < 32 {
+            op[n] = 1 << (n - 1);
+            n += 1;
+        }
+        let mut bits = 1;
+        while bits < 8 * len {
+            op = gf2_square(&op);
+            bits *= 2;
+        }
+        let mut tables = [[0u32; 256]; 4];
+        let mut byte = 0;
+        while byte < 4 {
+            let mut n = 0;
+            while n < 256 {
+                tables[byte][n] = gf2_times(&op, (n as u32) << (8 * byte));
+                n += 1;
+            }
+            byte += 1;
+        }
+        tables
+    }
+
+    const fn gf2_times(mat: &[u32; 32], mut vec: u32) -> u32 {
+        let mut sum = 0;
+        let mut i = 0;
+        while vec != 0 {
+            if vec & 1 != 0 {
+                sum ^= mat[i];
+            }
+            vec >>= 1;
+            i += 1;
+        }
+        sum
+    }
+
+    const fn gf2_square(mat: &[u32; 32]) -> [u32; 32] {
+        let mut square = [0u32; 32];
+        let mut n = 0;
+        while n < 32 {
+            square[n] = gf2_times(mat, mat[n]);
+            n += 1;
+        }
+        square
+    }
+
+    /// CRC-32C eight bytes at a time ("slicing by 8"), for CPUs without
+    /// CRC-32C instructions.
+    fn crc32c_tables(src: &[u8]) -> u32 {
         let table = &CRC32C_TABLES;
         let mut crc = !0u32;
         let mut chunks = src.chunks_exact(8);
@@ -885,6 +1067,30 @@ mod frame {
                 }
             }
             assert_eq!(crc32c(&data[..len]), !bitwise, "len {len}");
+            assert_eq!(crc32c_tables(&data[..len]), !bitwise, "len {len}");
+        }
+        // Lengths around the three-way blocks of the CRC instructions.
+        // The bytes must not repeat with a period that divides the block
+        // lengths, or the three streams' CRCs would be equal.
+        let mut x = 0x9e37_79b9u32;
+        let data: Vec<u8> = (0..3 * LONG + 1000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        for len in (0..data.len()).step_by(97).chain([
+            3 * SHORT,
+            3 * LONG,
+            3 * LONG + 3 * SHORT + 9,
+        ]) {
+            assert_eq!(
+                crc32c(&data[..len]),
+                crc32c_tables(&data[..len]),
+                "len {len}"
+            );
         }
     }
 }
