@@ -363,6 +363,43 @@ fn small_block_copies_match_snap() {
 }
 
 #[test]
+fn runs_of_identical_copies_match_snap() {
+    // Runs of identical copy-2 tags, which the decoder fills period by
+    // period, at every period it batches and lengths that end each fill
+    // block at a different point.
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let step = if cfg!(miri) { 7 } else { 1 };
+    for period in (8..=120).step_by(step) {
+        for (len, count) in [(64, 2), (64, 9), (61, 5), (17, 12), (40, 31)] {
+            let mut expected: Vec<u8> = (0..200).map(|_| rng.next() as u8).collect();
+            let mut body = Vec::new();
+            literal(&expected, &mut body);
+            for _ in 0..count {
+                body.push((((len - 1) << 2) | 2) as u8);
+                body.extend_from_slice(&(period as u16).to_le_bytes());
+                for _ in 0..len {
+                    expected.push(expected[expected.len() - period]);
+                }
+            }
+            let tail: Vec<u8> = (0..rng.below(80)).map(|_| rng.next() as u8).collect();
+            if !tail.is_empty() {
+                literal(&tail, &mut body);
+                expected.extend_from_slice(&tail);
+            }
+            let mut block = Vec::new();
+            header(expected.len(), &mut block);
+            block.extend_from_slice(&body);
+            assert_eq!(
+                snipsnap::decompress(&block).ok(),
+                Some(expected),
+                "period {period}, len {len}, count {count}"
+            );
+            check(&block);
+        }
+    }
+}
+
+#[test]
 fn mutated_blocks_agree_with_snap() {
     let mut rng = Rng(0xdead_beef_cafe_f00d);
     for round in 0..scaled(4000) {

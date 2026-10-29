@@ -65,8 +65,17 @@ pub(crate) unsafe fn copy_16_to_128(from: *const u8, to: *mut u8, len: usize) {
     debug_assert!((16..=128).contains(&len));
     unsafe {
         if len > 64 {
+            // The second copy is the smallest that reaches the end: for 80
+            // bytes, 64 and 16 rather than 64 and 64.
             ptr::copy_nonoverlapping(from, to, 64);
-            ptr::copy_nonoverlapping(from.add(len - 64), to.add(len - 64), 64);
+            let tail = if len <= 80 {
+                16
+            } else if len <= 96 {
+                32
+            } else {
+                64
+            };
+            ptr::copy_nonoverlapping(from.add(len - tail), to.add(len - tail), tail);
         } else if len > 32 {
             ptr::copy_nonoverlapping(from, to, 32);
             ptr::copy_nonoverlapping(from.add(len - 32), to.add(len - 32), 32);
