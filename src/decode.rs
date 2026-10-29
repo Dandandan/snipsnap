@@ -714,12 +714,22 @@ unsafe fn decode_run(
 unsafe fn fill_periodic(start: *mut u8, offset: usize, total: usize) {
     debug_assert!((1..=MAX_RUN_PERIOD).contains(&offset));
     unsafe {
-        let (source, block, mut pos) = if offset >= 16 {
+        // Periods shorter than 64 bytes are first written out as a block of
+        // whole periods, at most 64 bytes, which is then copied. Larger
+        // blocks measured slower.
+        let (source, block, mut pos) = if offset >= 64 {
             (start.sub(offset).cast_const(), offset, 0)
         } else {
-            // Write a first block of whole periods, then copy that.
-            let block = offset * 48usize.div_ceil(offset);
-            copy_overlapping(start, start, offset, block);
+            let block = offset * (64 / offset);
+            if offset >= 16 {
+                let mut pos = 0;
+                while pos < block {
+                    copy_16_to_128(start.sub(offset), start.add(pos), offset);
+                    pos += offset;
+                }
+            } else {
+                copy_overlapping(start, start, offset, block);
+            }
             (start.cast_const(), block, block)
         };
         while pos < total {
@@ -1028,16 +1038,20 @@ unsafe fn copy_overlapping(before: *const u8, dst: *mut u8, offset: usize, len: 
     unsafe {
         if offset < 8 {
             // Build eight bytes of the pattern from the last eight output
-            // bytes, then store it at a stride that keeps the phase.
+            // bytes, then store it at a stride that keeps the phase. The
+            // first four stores, at least 20 bytes, are unconditional: in
+            // integer columns most such copies need one or two, and a loop
+            // exit would mispredict between them.
             let pattern = pattern_8(before, offset);
             let stride = REPEAT_STRIDE[offset];
-            let mut i = 0;
-            loop {
+            write_u64(dst, pattern);
+            write_u64(dst.add(stride), pattern);
+            write_u64(dst.add(2 * stride), pattern);
+            write_u64(dst.add(3 * stride), pattern);
+            let mut i = 4 * stride;
+            while i < len {
                 write_u64(dst.add(i), pattern);
                 i += stride;
-                if i >= len {
-                    break;
-                }
             }
         } else if offset < 16 {
             copy_periods::<8>(before, dst, offset, len);

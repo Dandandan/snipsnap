@@ -71,16 +71,16 @@ pub(crate) unsafe fn copy_16_to_128(from: *const u8, to: *mut u8, len: usize) {
     unsafe {
         if len > 64 {
             // The second copy is the smallest that reaches the end: for 80
-            // bytes, 64 and 16 rather than 64 and 64.
+            // bytes, 64 and 16 rather than 64 and 64. Each size has a branch
+            // of its own, as a size picked at run time compiles to `memcpy`.
             ptr::copy_nonoverlapping(from, to, 64);
-            let tail = if len <= 80 {
-                16
+            if len <= 80 {
+                ptr::copy_nonoverlapping(from.add(len - 16), to.add(len - 16), 16);
             } else if len <= 96 {
-                32
+                ptr::copy_nonoverlapping(from.add(len - 32), to.add(len - 32), 32);
             } else {
-                64
-            };
-            ptr::copy_nonoverlapping(from.add(len - tail), to.add(len - tail), tail);
+                ptr::copy_nonoverlapping(from.add(len - 64), to.add(len - 64), 64);
+            }
         } else if len > 32 {
             ptr::copy_nonoverlapping(from, to, 32);
             ptr::copy_nonoverlapping(from.add(len - 32), to.add(len - 32), 32);
