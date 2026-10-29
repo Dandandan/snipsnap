@@ -426,17 +426,26 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                 }
                 let from = select_ptr_if_zero(tag_type, ip, match_from);
                 // SAFETY: the pending copy is within the margins (see
-                // `copy_pending`).
+                // `copy_pending`), and so are 64 bytes from either end of it.
                 unsafe {
-                    ptr::copy(pending_from, out, FAST_COPY);
-                    if WIDE && pending_len > FAST_COPY {
-                        cold();
-                        align_32::<UNROLL>();
-                        ptr::copy(
-                            pending_from.add(FAST_COPY),
-                            out.add(FAST_COPY),
-                            64 - FAST_COPY,
-                        );
+                    if WIDE && cfg!(target_arch = "x86_64") {
+                        // On x86-64 the branch on the copy's length cost more
+                        // than copying 64 bytes every time: in ClickBench's
+                        // URLs and titles, copies of up to 32 bytes and of 64
+                        // bytes alternate unpredictably. On aarch64 the extra
+                        // stores cost more than the mispredictions.
+                        ptr::copy(pending_from, out, 64);
+                    } else {
+                        ptr::copy(pending_from, out, FAST_COPY);
+                        if WIDE && pending_len > FAST_COPY {
+                            cold();
+                            align_32::<UNROLL>();
+                            ptr::copy(
+                                pending_from.add(FAST_COPY),
+                                out.add(FAST_COPY),
+                                64 - FAST_COPY,
+                            );
+                        }
                     }
                 }
                 out = element_out;
@@ -594,8 +603,9 @@ fn align_32<const UNROLL: usize>() {
     }
 }
 
-/// Source of the fast loop's deferred copy when no element is pending.
-static NO_COPY: [u8; FAST_COPY] = [0; FAST_COPY];
+/// Source of the fast loop's deferred copy when no element is pending, as
+/// long as the longest copy of it.
+static NO_COPY: [u8; 64] = [0; 64];
 
 /// Copies the element deferred by the fast loop: `len <= 64` bytes from
 /// `from` to `to`, writing `FAST_COPY` or 64 bytes.
