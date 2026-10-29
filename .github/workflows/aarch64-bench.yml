@@ -1,0 +1,34 @@
+name: aarch64 benchmark
+
+on:
+  push:
+    branches: [ccr-e4c01f21-x6mf9a]
+    paths: ["src/**", "examples/**", ".github/aarch64-bench/**", ".github/workflows/aarch64-bench.yml"]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build C++ snappy with clang
+        run: |
+          sudo apt-get install -y -q clang cmake
+          git clone -q https://github.com/google/snappy.git "$RUNNER_TEMP/snappy-src"
+          git -C "$RUNNER_TEMP/snappy-src" checkout -q 9466064
+          cmake -S "$RUNNER_TEMP/snappy-src" -B "$RUNNER_TEMP/snappy-build" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBUILD_SHARED_LIBS=ON \
+            -DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/snappy"
+          cmake --build "$RUNNER_TEMP/snappy-build" -j4 && cmake --install "$RUNNER_TEMP/snappy-build"
+      - name: Download a ClickBench partition
+        run: curl -sSfL -o "$RUNNER_TEMP/hits_0.parquet" https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
+      - name: Benchmark
+        run: .github/aarch64-bench/run.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/work" 2>&1 | tee "$RUNNER_TEMP/bench.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: ${{ runner.temp }}/bench.txt
