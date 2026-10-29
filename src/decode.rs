@@ -22,7 +22,7 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use crate::bytes::{
-    copy_16_to_128, copy_exact, copy_short, read_32, read_u16, read_u32, read_u64,
+    copy_16_to_64, copy_exact, copy_short, read_32, read_u16, read_u32, read_u64,
     write_16, write_32, write_u16, write_u32, write_u64,
 };
 use crate::select::{opaque, select_if_zero, select_ptr_if_zero};
@@ -432,26 +432,6 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                     if WIDE && pending_len > FAST_COPY {
                         cold();
                         align_32::<UNROLL>();
-                        // Only a copy-2 tag of 64 bytes (`0xfe`) is longer
-                        // than any literal here. If this element repeats it,
-                        // the two start a run of identical copies, as found
-                        // in data with periods of 64 to `MAX_RUN_PERIOD`
-                        // bytes; see `decode_run`, which takes over at the
-                        // pending element. The period is tested first: most
-                        // long copies in text-like data, such as ClickBench's
-                        // titles and URLs, are 64-byte copies one after the
-                        // other at longer periods, where testing the tag
-                        // first measured slower.
-                        if out.addr().wrapping_sub(pending_from.addr()) <= MAX_RUN_PERIOD
-                            && tag == 0xfe
-                            && pending_len == 64
-                            && next_is_same(ip.sub(3), ip, 2)
-                        {
-                            ip = ip.sub(3);
-                            pending_from = NO_COPY.as_ptr();
-                            pending_len = 0;
-                            break $exit;
-                        }
                         ptr::copy(
                             pending_from.add(FAST_COPY),
                             out.add(FAST_COPY),
@@ -607,9 +587,18 @@ unsafe fn copy_pending(from: *const u8, to: *mut u8, len: usize) {
     }
 }
 
-/// Longest period [`decode_run`] handles, which bounds how far
-/// [`fill_periodic`] writes past the end of a run.
-const MAX_RUN_PERIOD: usize = 112;
+/// Longest period [`decode_run`] handles.
+///
+/// The fast loop hands it runs of overlapping copies, whose offsets are
+/// below 64. Runs of 64-byte copies at longer periods are decoded as
+/// separate copies: spotting them in the fast loop took a branch that, in
+/// ClickBench's URLs and titles, mispredicted more often than the runs it
+/// found saved.
+const MAX_RUN_PERIOD: usize = 64;
+
+/// How far [`fill_periodic`] may write past the end of a run: up to 63 bytes
+/// for its last block, and up to 79 from the start of the run for its first.
+const RUN_WRITE_SLOP: usize = 80;
 
 /// Whether the copy whose tag (of type `tag_type`) is at `ip - 1` is
 /// followed by an identical one; `next_ip` is just past the next element's
@@ -675,7 +664,7 @@ unsafe fn decode_run(
         return None;
     }
     // Leave room for the overshoot of `fill_periodic`.
-    let max_count = (dst_len - op).saturating_sub(MAX_RUN_PERIOD) / len;
+    let max_count = (dst_len - op).saturating_sub(RUN_WRITE_SLOP) / len;
     // Elements are compared as masked four-byte words, which compiles to a
     // load and a compare rather than a call to `bcmp`. Elements in the last
     // three bytes of the input are left to the careful path.
@@ -701,7 +690,7 @@ unsafe fn decode_run(
 }
 
 /// Writes `total` bytes at `start` that repeat the `offset` bytes before it,
-/// possibly writing up to `MAX_RUN_PERIOD` more bytes past the end.
+/// possibly writing up to `RUN_WRITE_SLOP` more bytes past the end.
 ///
 /// The output is written in blocks copied from a source that is complete
 /// before the first block is stored, so no load depends on a recent store.
@@ -709,31 +698,26 @@ unsafe fn decode_run(
 /// # Safety
 ///
 /// `1 <= offset <= MAX_RUN_PERIOD`, `max(offset, 8)` bytes before `start`
-/// initialized and `start[..total + MAX_RUN_PERIOD]` valid for writes.
+/// initialized and `start[..total + RUN_WRITE_SLOP]` valid for writes.
 #[inline(always)]
 unsafe fn fill_periodic(start: *mut u8, offset: usize, total: usize) {
     debug_assert!((1..=MAX_RUN_PERIOD).contains(&offset));
     unsafe {
-        // Periods shorter than 64 bytes are first written out as a block of
-        // whole periods, at most 64 bytes, which is then copied. Larger
-        // blocks measured slower.
-        let (source, block, mut pos) = if offset >= 64 {
-            (start.sub(offset).cast_const(), offset, 0)
-        } else {
-            let block = offset * (64 / offset);
-            if offset >= 16 {
-                let mut pos = 0;
-                while pos < block {
-                    copy_16_to_128(start.sub(offset), start.add(pos), offset);
-                    pos += offset;
-                }
-            } else {
-                copy_overlapping(start, start, offset, block);
+        // The periods are first written out as a block of whole periods, at
+        // most 64 bytes, which is then copied. Larger blocks measured slower.
+        let block = offset * (64 / offset);
+        if offset >= 16 {
+            let mut pos = 0;
+            while pos < block {
+                copy_16_to_64(start.sub(offset), start.add(pos), offset);
+                pos += offset;
             }
-            (start.cast_const(), block, block)
-        };
+        } else {
+            copy_overlapping(start, start, offset, block);
+        }
+        let mut pos = block;
         while pos < total {
-            copy_16_to_128(source, start.add(pos), block);
+            copy_16_to_64(start, start.add(pos), block);
             pos += block;
         }
     }
