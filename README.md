@@ -86,6 +86,13 @@ boundaries; three of the C++ library's do not. On such a host, an earlier
 version of snipsnap measured 1.21x as fast as C++ on the query-weighted
 ClickBench pages, and 5.1 GB/s against 3.1 GB/s on the 24 cases.
 
+Framed streams check every chunk's CRC-32C with the CPU's CRC instructions
+where it has them (SSE4.2 on x86, the CRC extension on Arm, detected at run
+time), in three interleaved streams. The reader decodes chunks straight into
+the caller's buffer when they fit. On x86, reading an 8 MiB framed stream
+written by `snap` runs at 1.2–5.9 GB/s, 1.5–2.0x as fast as `snap`'s
+reader, and stored chunks read at 6.7–7.0 GB/s.
+
 Other cases can still move by 10–30% with code layout (for all three
 libraries), so compare best-of-several runs. C++ snappy is tuned for clang;
 a GCC build decompresses 2–3x slower.
