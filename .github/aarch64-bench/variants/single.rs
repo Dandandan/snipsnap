@@ -442,16 +442,19 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                         // titles and URLs, are 64-byte copies one after the
                         // other at longer periods, where testing the tag
                         // first measured slower.
-                        // Zero when this element is a 64-byte copy-2 tag
-                        // with the same bytes as the 3 before it: one branch,
-                        // taken only within runs and long matches.
+                        // Zero exactly when the pending element and this
+                        // one are the same 64-byte copy-2 tag, at a period
+                        // of at most `MAX_RUN_PERIOD`. Each part on its own
+                        // is unpredictable in text (a quarter of the long
+                        // copies in ClickBench's URLs have short offsets),
+                        // so they are combined into one rarely taken branch.
+                        let far = usize::from(
+                            out.addr().wrapping_sub(pending_from.addr()) > MAX_RUN_PERIOD,
+                        );
                         let differs = ((read_u32(ip.sub(4)) ^ read_u32(ip.sub(1)))
-                            & 0xff_ffff)
-                            | (tag ^ 0xfe) as u32;
-                        if differs == 0
-                            && pending_len == 64
-                            && out.addr().wrapping_sub(pending_from.addr()) <= MAX_RUN_PERIOD
-                        {
+                            & 0xff_ffff) as usize
+                            | (tag ^ 0xfe);
+                        if opaque(far | differs | (pending_len ^ 64)) == 0 {
                             ip = ip.sub(3);
                             pending_from = NO_COPY.as_ptr();
                             pending_len = 0;
