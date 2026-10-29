@@ -53,7 +53,7 @@ SAMPLES=${SAMPLES:-30} taskset -c $CPU "$W/target-dbench/release/dbench"
 echo "== perf counters, ClickBench URL pages"
 if command -v perf >/dev/null; then
   # The first run decodes nothing: its counts are the setup to subtract.
-  for only in head:0 head:30 norun:30 samefirst:30 C++:30; do
+  for only in head:0 head:30 norun:30 fused:30 C++:30; do
     DBENCH_ONLY=${only%:*} DBENCH_REPS=${only#*:} perf stat \
       -e cycles,instructions,branch-misses,stalled-cycles-frontend,stalled-cycles-backend,L1-dcache-load-misses \
       taskset -c $CPU "$W/target-dbench/release/dbench" @cb_url 2>&1 | grep -vE "^\s*$" || true
