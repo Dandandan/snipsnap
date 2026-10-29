@@ -53,7 +53,7 @@ snappy 1.3.1 built with clang 18:
 
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
-| decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 5.9 GB/s | 3.3 GB/s | 4.2 GB/s |
+| decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 5.8 GB/s | 3.4 GB/s | 4.2 GB/s |
 | decompress, Arm Neoverse-N2 (GitHub's Arm runner) | 8.7 GB/s | 4.6 GB/s | 6.9 GB/s |
 | compress, Intel Xeon | 2.3 GB/s | 2.1 GB/s | 2.2 GB/s |
 | compress, Arm Neoverse-N2 | 3.1 GB/s | 2.6 GB/s | 2.9 GB/s |
@@ -66,14 +66,16 @@ small blocks:
 - 256-byte blocks decompress 2.9x as fast.
 
 Text, HTML, URLs and protobuf decompress 1.02–1.06x as fast as C++ on Arm
-and at 0.96–1.01x its speed on x86, and 1.4–2.1x as fast as `snap`.
+and at 0.93–0.98x its speed on x86, and 1.3–2.0x as fast as `snap`. On
+x86 the fast loop copies 64 bytes for every element instead of branching
+on its length, which costs plain text a few percent and pays off on
+ClickBench, below.
 
 On ClickBench (`hits_0.parquet`: 728 Snappy pages, 378 MB decoded, mostly
-1 MB pages of titles and URLs), the pages decompress 1.02x as fast as C++
-on Arm and at 0.97x its speed on x86, and 1.5–1.6x as fast as `snap`.
-Weighted by the columns each of the 43 queries reads, x86 decompression is
-0.99x as fast as C++. URLs, read by 10 of the queries, are most of that
-work.
+1 MB pages of titles and URLs), the pages decompress 1.01–1.02x as fast as
+C++ and 1.5–1.7x as fast as `snap`. Weighted by the columns each of the 43
+queries reads, x86 decompression is 1.13x as fast as C++. URLs, read by 10
+of the queries, are most of that work.
 
 On Intel cores from Skylake to Cascade Lake with Intel's microcode update
 for the JCC erratum, a 32-byte block of code holding a branch that crosses
