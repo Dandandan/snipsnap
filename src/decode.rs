@@ -487,8 +487,9 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
 /// copy.
 ///
 /// Both candidates are loaded before selecting, which keeps the select off
-/// the load-to-load dependency chain; on x86-64 the select uses the flags of
-/// `tag & 3`, as in the C++ library.
+/// the load-to-load dependency chain. On x86-64 and aarch64 the select uses
+/// the flags of `tag & 3`, as in the C++ library, which saves a compare per
+/// tag.
 ///
 /// # Safety
 ///
@@ -513,6 +514,27 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
                 t = out(reg) tag_type,
                 n = out(reg) next_tag,
                 l = inout(reg) tag => _,
+                options(pure, readonly, nostack),
+            );
+        }
+        return (tag_type, next_tag);
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if WIDE {
+        let (tag_type, next_tag);
+        // SAFETY: the caller guarantees both loads are in bounds.
+        unsafe {
+            std::arch::asm!(
+                "ands {t}, {tag}, #3",
+                "add {l}, {ip}, {tag}, lsr #2",
+                "ldrb {n:w}, [{ip}, {t}]",
+                "ldrb {l:w}, [{l}, #1]",
+                "csel {n}, {l}, {n}, eq",
+                tag = in(reg) tag,
+                ip = in(reg) ip,
+                t = out(reg) tag_type,
+                n = out(reg) next_tag,
+                l = out(reg) _,
                 options(pure, readonly, nostack),
             );
         }
