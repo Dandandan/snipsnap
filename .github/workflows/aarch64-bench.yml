@@ -18,6 +18,8 @@ jobs:
       - name: Build C++ snappy with clang
         run: |
           sudo apt-get install -y -q clang cmake
+          sudo apt-get install -y -q linux-tools-common "linux-tools-$(uname -r)" || true
+          echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
           git clone -q https://github.com/google/snappy.git "$RUNNER_TEMP/snappy-src"
           git -C "$RUNNER_TEMP/snappy-src" checkout -q 9466064
           cmake -S "$RUNNER_TEMP/snappy-src" -B "$RUNNER_TEMP/snappy-build" -DCMAKE_BUILD_TYPE=Release \

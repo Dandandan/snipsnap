@@ -123,6 +123,20 @@ fn clickbench(f: &str, cols: &[u32], samples: usize, names: &[&str], glog: &mut 
     let mut best = vec![f64::MAX; names.len() + 2];
     let mut cal = f64::MAX;
     let mut snap_dec = snap::raw::Decoder::new();
+    // DBENCH_ONLY=<variant name or C++>: decode with that one only, for
+    // `perf stat`.
+    if let Ok(only) = std::env::var("DBENCH_ONLY") {
+        let reps: usize = std::env::var("DBENCH_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let v = VARIANTS.iter().find(|v| v.0 == only);
+        for _ in 0..reps {
+            match v {
+                Some(v) => for c in &comp { let (len, h) = header(c); let _ = (v.1)(std::hint::black_box(&c[h..]), &mut out[..len]); },
+                None => for c in &comp { let (len, _) = header(c); let mut ul = len; unsafe { snappy_uncompress(std::hint::black_box(c.as_ptr()), c.len(), out_cpp.as_mut_ptr(), &mut ul) }; },
+            }
+        }
+        println!("{f}: {only} x{reps}, {tags} tags each");
+        return;
+    }
     for _ in 0..samples {
         for (i, v) in VARIANTS.iter().enumerate() {
             let c0 = tsc();
