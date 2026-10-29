@@ -20,7 +20,7 @@ echo "== pages of $HITS"
 cargo build --release -q --manifest-path "$HERE/pqdump/Cargo.toml" --target-dir "$W/target-pqdump"
 "$W/target-pqdump/release/pqdump" "$HITS" "$W/hits_pages.bin" | tail -1
 
-if [ -z "${SKIP_COMPARE:-1}" ]; then
+if [ -z "${SKIP_COMPARE:-}" ]; then
 echo "== compare example: head and $BASE_REF"
 rm -rf "$W/base" && git -C "$REPO" worktree add -f -q "$W/base" "$BASE_REF"
 for t in head base; do
@@ -54,8 +54,8 @@ SAMPLES=${SAMPLES:-30} taskset -c $CPU "$W/target-dbench/release/dbench"
 echo "== perf counters"
 if command -v perf >/dev/null; then
   # The first run decodes nothing: its counts are the setup to subtract.
-  for file in @cb_title @mixed_256k @cb_other; do
-    for only in head:0 head:30 lsrchain:30 C++:30; do
+  for file in @cb_url @cb_title; do
+    for only in head:0 head:30 C++:30; do
       DBENCH_ONLY=${only%:*} DBENCH_REPS=${only#*:} perf stat \
         -e cycles,instructions,branch-misses \
         taskset -c $CPU "$W/target-dbench/release/dbench" $file 2>&1 | grep -E "x[0-9]|cycles|instr|branch" || true
