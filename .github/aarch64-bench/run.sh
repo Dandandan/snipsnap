@@ -8,7 +8,7 @@
 set -euo pipefail
 SNAPPY=$(realpath "$1"); HITS=$(realpath "$2"); W=$(realpath -m "$3")
 REPO=$(git rev-parse --show-toplevel); HERE="$REPO/.github/aarch64-bench"
-BASE_REF=${BASE_REF:-0641543}
+BASE_REF=${BASE_REF:-f2dc1f4}
 CPU=${CPU:-1}
 mkdir -p "$W"
 export LD_LIBRARY_PATH="$SNAPPY/lib"
@@ -20,6 +20,7 @@ echo "== pages of $HITS"
 cargo build --release -q --manifest-path "$HERE/pqdump/Cargo.toml" --target-dir "$W/target-pqdump"
 "$W/target-pqdump/release/pqdump" "$HITS" "$W/hits_pages.bin" | tail -1
 
+if [ -z "${SKIP_COMPARE:-1}" ]; then
 echo "== compare example: head and $BASE_REF"
 rm -rf "$W/base" && git -C "$REPO" worktree add -f -q "$W/base" "$BASE_REF"
 for t in head base; do
@@ -36,6 +37,7 @@ done
 echo "-- head, encode"
 SNIPSNAP_PARQUET_BENCH=$HITS taskset -c $CPU "$W/compare-head" --encode --samples 6 | tail -26
 
+fi
 echo "== decoder variants"
 D="$W/dbench"; rm -rf "$D" && cp -r "$HERE/dbench" "$D"
 cp "$REPO/src/select.rs" "$REPO/src/bytes.rs" "$D/src/"
@@ -54,7 +56,7 @@ echo "== perf counters"
 if command -v perf >/dev/null; then
   # The first run decodes nothing: its counts are the setup to subtract.
   for file in @cb_url @cb_title; do
-    for only in head:0 head:30 base:30 C++:30; do
+    for only in head:0 head:30 a64asm:30 C++:30; do
       DBENCH_ONLY=${only%:*} DBENCH_REPS=${only#*:} perf stat \
         -e cycles,instructions,branch-misses \
         taskset -c $CPU "$W/target-dbench/release/dbench" $file 2>&1 | grep -E "x[0-9]|cycles|instr|branch" || true
@@ -62,20 +64,3 @@ if command -v perf >/dev/null; then
   done
 fi
 
-echo "== branch-miss and cycle profiles, ClickBench URL pages"
-if command -v perf >/dev/null; then
-  for ev in branch-misses cycles; do
-    DBENCH_ONLY=head DBENCH_REPS=20 perf record -q -e $ev -o "$W/perf.$ev" \
-      taskset -c $CPU "$W/target-dbench/release/dbench" @cb_url > /dev/null 2>&1 || true
-    perf report -i "$W/perf.$ev" --stdio --sort sym 2>/dev/null | grep -v "^#" | grep -v "^$" | head -8
-    sym=$(perf report -i "$W/perf.$ev" --stdio --sort sym --no-demangle 2>/dev/null | grep -o "_R[A-Za-z0-9_]*v_head11decode_fastKj2_Kb1_[A-Za-z0-9_]*" | head -1)
-    echo "annotating $sym"
-    if [ -n "$sym" ]; then
-      perf annotate -i "$W/perf.$ev" --stdio --no-source 2>&1 | awk '/Percent/ {n++} n == 1' > "$W/annot.$ev" || true
-      # Lines with at least 0.5% of the samples, plus their neighbours.
-      awk '$1 ~ /^[0-9]+\.[0-9]+$/ && $1 >= 0.5 {print NR}' "$W/annot.$ev" > "$W/hot.$ev" || true
-      awk 'NR==FNR {h[$1]=1; next} (h[FNR-2]||h[FNR-1]||h[FNR]||h[FNR+1]) {print}' "$W/hot.$ev" "$W/annot.$ev" | head -150 || true
-      head -5 "$W/annot.$ev" || true
-    fi
-  done
-fi
