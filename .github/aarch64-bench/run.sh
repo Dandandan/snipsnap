@@ -8,7 +8,7 @@
 set -euo pipefail
 SNAPPY=$(realpath "$1"); HITS=$(realpath "$2"); W=$(realpath -m "$3")
 REPO=$(git rev-parse --show-toplevel); HERE="$REPO/.github/aarch64-bench"
-BASE_REF=${BASE_REF:-f4131a1}
+BASE_REF=${BASE_REF:-0641543}
 CPU=${CPU:-1}
 mkdir -p "$W"
 export LD_LIBRARY_PATH="$SNAPPY/lib"
@@ -50,13 +50,15 @@ SNAPPY_LIB="$SNAPPY/lib" cargo build --release -q --manifest-path "$D/Cargo.toml
 export DBENCH_PAGES="$W/hits_pages.bin" DBENCH_CORPUS="$REPO/tests/rust-snappy-data"
 SAMPLES=${SAMPLES:-30} taskset -c $CPU "$W/target-dbench/release/dbench"
 
-echo "== perf counters, ClickBench URL pages"
+echo "== perf counters"
 if command -v perf >/dev/null; then
   # The first run decodes nothing: its counts are the setup to subtract.
-  for only in head:0 head:30 norun:30 single:30 C++:30; do
-    DBENCH_ONLY=${only%:*} DBENCH_REPS=${only#*:} perf stat \
-      -e cycles,instructions,branch-misses,stalled-cycles-frontend,stalled-cycles-backend,L1-dcache-load-misses \
-      taskset -c $CPU "$W/target-dbench/release/dbench" @cb_url 2>&1 | grep -vE "^\s*$" || true
+  for file in @ints_1m @cb_other; do
+    for only in head:0 head:30 base:30 C++:30; do
+      DBENCH_ONLY=${only%:*} DBENCH_REPS=${only#*:} perf stat \
+        -e cycles,instructions,branch-misses \
+        taskset -c $CPU "$W/target-dbench/release/dbench" $file 2>&1 | grep -E "x[0-9]|cycles|instr|branch" || true
+    done
   done
 fi
 
