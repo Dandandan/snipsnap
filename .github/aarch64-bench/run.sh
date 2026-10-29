@@ -8,7 +8,7 @@
 set -euo pipefail
 SNAPPY=$(realpath "$1"); HITS=$(realpath "$2"); W=$(realpath -m "$3")
 REPO=$(git rev-parse --show-toplevel); HERE="$REPO/.github/aarch64-bench"
-BASE_REF=${BASE_REF:-f2dc1f4}
+BASE_REF=${BASE_REF:-f4131a1}
 CPU=${CPU:-1}
 mkdir -p "$W"
 export LD_LIBRARY_PATH="$SNAPPY/lib"
@@ -20,7 +20,7 @@ echo "== pages of $HITS"
 cargo build --release -q --manifest-path "$HERE/pqdump/Cargo.toml" --target-dir "$W/target-pqdump"
 "$W/target-pqdump/release/pqdump" "$HITS" "$W/hits_pages.bin" | tail -1
 
-if [ -z "${SKIP_COMPARE:-1}" ]; then
+if [ -z "${SKIP_COMPARE:-}" ]; then
 echo "== compare example: head and $BASE_REF"
 rm -rf "$W/base" && git -C "$REPO" worktree add -f -q "$W/base" "$BASE_REF"
 for t in head base; do
@@ -44,7 +44,6 @@ cp "$REPO/src/select.rs" "$REPO/src/bytes.rs" "$D/src/"
 : > "$D/src/variants.rs"; list=""
 add() { cp "$2" "$D/src/v_$1.rs"; echo "#[path = \"v_$1.rs\"] mod v_$1;" >> "$D/src/variants.rs"; list="$list (\"$1\", v_$1::decode_body as fn(&[u8], &mut [MaybeUninit<u8>]) -> Result<()>),"; }
 add head "$REPO/src/decode.rs"
-git -C "$REPO" show "$BASE_REF:src/decode.rs" > "$W/decode_base.rs"; add base "$W/decode_base.rs"
 for f in "$HERE"/variants/*.rs; do [ -e "$f" ] && add "$(basename "$f" .rs)" "$f"; done
 add head2 "$REPO/src/decode.rs"
 echo "static VARIANTS: &[(&str, fn(&[u8], &mut [MaybeUninit<u8>]) -> Result<()>)] = &[$list];" >> "$D/src/variants.rs"
@@ -56,7 +55,7 @@ echo "== perf counters"
 if command -v perf >/dev/null; then
   # The first run decodes nothing: its counts are the setup to subtract.
   for file in @cb_url @cb_title; do
-    for only in head:0 head:30 a64asm:30 C++:30; do
+    for only in head:0 head:30 C++:30; do
       DBENCH_ONLY=${only%:*} DBENCH_REPS=${only#*:} perf stat \
         -e cycles,instructions,branch-misses \
         taskset -c $CPU "$W/target-dbench/release/dbench" $file 2>&1 | grep -E "x[0-9]|cycles|instr|branch" || true
