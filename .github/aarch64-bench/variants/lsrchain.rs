@@ -428,19 +428,15 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                 // SAFETY: the pending copy is within the margins (see
                 // `copy_pending`).
                 unsafe {
-                    if WIDE && cfg!(target_arch = "aarch64") {
-                        ptr::copy(pending_from, out, 64);
-                    } else {
-                        ptr::copy(pending_from, out, FAST_COPY);
-                        if WIDE && pending_len > FAST_COPY {
-                            cold();
-                            align_32::<UNROLL>();
-                            ptr::copy(
-                                pending_from.add(FAST_COPY),
-                                out.add(FAST_COPY),
-                                64 - FAST_COPY,
-                            );
-                        }
+                    ptr::copy(pending_from, out, FAST_COPY);
+                    if WIDE && pending_len > FAST_COPY {
+                        cold();
+                        align_32::<UNROLL>();
+                        ptr::copy(
+                            pending_from.add(FAST_COPY),
+                            out.add(FAST_COPY),
+                            64 - FAST_COPY,
+                        );
                     }
                 }
                 out = element_out;
@@ -529,16 +525,18 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
         // SAFETY: the caller guarantees both loads are in bounds.
         unsafe {
             std::arch::asm!(
+                "add {p}, {ip}, #1",
                 "ands {t}, {tag}, #3",
-                "add {l}, {ip}, {tag}, lsr #2",
+                "lsr {l}, {tag}, #2",
                 "ldrb {n:w}, [{ip}, {t}]",
-                "ldrb {l:w}, [{l}, #1]",
+                "ldrb {l:w}, [{p}, {l}]",
                 "csel {n}, {l}, {n}, eq",
                 tag = in(reg) tag,
                 ip = in(reg) ip,
                 t = out(reg) tag_type,
                 n = out(reg) next_tag,
                 l = out(reg) _,
+                p = out(reg) _,
                 options(pure, readonly, nostack),
             );
         }
@@ -591,7 +589,7 @@ fn align_32<const UNROLL: usize>() {
 }
 
 /// Source of the fast loop's deferred copy when no element is pending.
-static NO_COPY: [u8; 64] = [0; 64];
+static NO_COPY: [u8; FAST_COPY] = [0; FAST_COPY];
 
 /// Copies the element deferred by the fast loop: `len <= 64` bytes from
 /// `from` to `to`, writing `FAST_COPY` or 64 bytes.

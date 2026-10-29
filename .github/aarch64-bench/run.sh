@@ -55,7 +55,7 @@ echo "== perf counters"
 if command -v perf >/dev/null; then
   # The first run decodes nothing: its counts are the setup to subtract.
   for file in @cb_title @mixed_256k @cb_other; do
-    for only in head:0 head:30 copy64:30 C++:30; do
+    for only in head:0 head:30 lsrchain:30 C++:30; do
       DBENCH_ONLY=${only%:*} DBENCH_REPS=${only#*:} perf stat \
         -e cycles,instructions,branch-misses \
         taskset -c $CPU "$W/target-dbench/release/dbench" $file 2>&1 | grep -E "x[0-9]|cycles|instr|branch" || true
