@@ -68,7 +68,12 @@ if command -v perf >/dev/null; then
     perf report -i "$W/perf.$ev" --stdio --sort sym 2>/dev/null | grep -v "^#" | grep -v "^$" | head -8
     sym=$(perf report -i "$W/perf.$ev" --stdio --sort sym --no-demangle 2>/dev/null | grep -o "_R[A-Za-z0-9_]*v_head11decode_fastKj2_Kb1_[A-Za-z0-9_]*" | head -1)
     echo "annotating $sym"
-    [ -n "$sym" ] && perf annotate -i "$W/perf.$ev" --stdio -s "$sym" 2>/dev/null \
-      | grep -E "^\s+[0-9]+\.[0-9]+" | sort -rn | head -30
+    if [ -n "$sym" ]; then
+      perf annotate -i "$W/perf.$ev" --stdio --no-source "$sym" > "$W/annot.$ev" 2>&1 || true
+      # Lines with at least 0.5% of the samples, plus their neighbours.
+      awk '$1 ~ /^[0-9]+\.[0-9]+$/ && $1 >= 0.5 {print NR}' "$W/annot.$ev" > "$W/hot.$ev" || true
+      awk 'NR==FNR {h[$1]=1; next} (h[FNR-2]||h[FNR-1]||h[FNR]||h[FNR+1]) {print}' "$W/hot.$ev" "$W/annot.$ev" | head -150 || true
+      head -5 "$W/annot.$ev" || true
+    fi
   done
 fi
