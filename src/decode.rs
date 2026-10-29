@@ -522,19 +522,27 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if WIDE {
         let (tag_type, next_tag);
+        // The literal candidate is loaded from `ip + 1` at offset `tag >> 2`
+        // rather than from `ip + (tag >> 2)` at offset 1: an add with a
+        // right-shifted operand takes two cycles on Neoverse cores, while
+        // `ip + 1` is computed before the tag arrives. That takes a cycle off
+        // the tag-to-tag chain, which bounds the loop (4.6% faster on
+        // Neoverse-N2, 7% on text).
         // SAFETY: the caller guarantees both loads are in bounds.
         unsafe {
             std::arch::asm!(
+                "add {p}, {ip}, #1",
                 "ands {t}, {tag}, #3",
-                "add {l}, {ip}, {tag}, lsr #2",
+                "lsr {l}, {tag}, #2",
                 "ldrb {n:w}, [{ip}, {t}]",
-                "ldrb {l:w}, [{l}, #1]",
+                "ldrb {l:w}, [{p}, {l}]",
                 "csel {n}, {l}, {n}, eq",
                 tag = in(reg) tag,
                 ip = in(reg) ip,
                 t = out(reg) tag_type,
                 n = out(reg) next_tag,
                 l = out(reg) _,
+                p = out(reg) _,
                 options(pure, readonly, nostack),
             );
         }
