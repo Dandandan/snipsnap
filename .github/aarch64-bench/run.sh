@@ -59,3 +59,16 @@ if command -v perf >/dev/null; then
       taskset -c $CPU "$W/target-dbench/release/dbench" @cb_url 2>&1 | grep -vE "^\s*$" || true
   done
 fi
+
+echo "== branch-miss and cycle profiles, ClickBench URL pages"
+if command -v perf >/dev/null; then
+  for ev in branch-misses cycles; do
+    DBENCH_ONLY=head DBENCH_REPS=20 perf record -q -e $ev -o "$W/perf.$ev" \
+      taskset -c $CPU "$W/target-dbench/release/dbench" @cb_url > /dev/null 2>&1 || true
+    perf report -i "$W/perf.$ev" --stdio --sort sym 2>/dev/null | grep -v "^#" | grep -v "^$" | head -8
+    sym=$(perf report -i "$W/perf.$ev" --stdio --sort sym --no-demangle 2>/dev/null | grep -o "_R[A-Za-z0-9_]*v_head11decode_fastKj2_Kb1_[A-Za-z0-9_]*" | head -1)
+    echo "annotating $sym"
+    [ -n "$sym" ] && perf annotate -i "$W/perf.$ev" --stdio -s "$sym" 2>/dev/null \
+      | grep -E "^\s+[0-9]+\.[0-9]+" | sort -rn | head -30
+  done
+fi
