@@ -1059,6 +1059,12 @@ unsafe fn pattern_8(end: *const u8, offset: usize) -> u64 {
 #[inline(always)]
 unsafe fn copy_overlapping(before: *const u8, dst: *mut u8, offset: usize, len: usize) {
     debug_assert!(offset >= 1 && offset < len && len <= 64);
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if offset < 16 {
+        // SAFETY: as for this function.
+        unsafe { copy_pattern_neon(before, dst, offset, len) };
+        return;
+    }
     unsafe {
         if offset < 8 {
             // Build eight bytes of the pattern from the last eight output
@@ -1091,6 +1097,81 @@ unsafe fn copy_overlapping(before: *const u8, dst: *mut u8, offset: usize, len: 
         }
     }
 }
+
+/// `copy_overlapping` for `offset < 16` with NEON table lookups, as in the
+/// C++ library: 16 bytes of the pattern are built in a register, stored,
+/// and rotated by `16 % offset` for each next 16 bytes, so the stores are
+/// consecutive and their number depends only on whether `len > 32`.
+///
+/// # Safety
+///
+/// As for [`copy_overlapping`].
+#[cfg(all(target_arch = "aarch64", not(miri)))]
+#[inline(always)]
+unsafe fn copy_pattern_neon(before: *const u8, dst: *mut u8, offset: usize, len: usize) {
+    use std::arch::aarch64::{
+        vcombine_u64, vcreate_u64, vdupq_n_u64, vld1q_u8, vqtbl1q_u8,
+        vreinterpretq_u8_u64, vst1q_u8,
+    };
+    debug_assert!(offset < 16);
+    unsafe {
+        // The pattern's bytes in a register: for `offset < 8` eight bytes of
+        // it from `pattern_8`, else its first and last eight bytes.
+        let bytes = if offset < 8 {
+            vreinterpretq_u8_u64(vdupq_n_u64(pattern_8(before, offset)))
+        } else {
+            let head = vcreate_u64(read_u64(before.sub(offset)));
+            let tail = vcreate_u64(read_u64(before.sub(8)));
+            vreinterpretq_u8_u64(vcombine_u64(head, tail))
+        };
+        let mut pattern = vqtbl1q_u8(bytes, vld1q_u8(PATTERN_LANES[offset].as_ptr()));
+        let rotate = vld1q_u8(PATTERN_ROTATE[offset].as_ptr());
+        vst1q_u8(dst, pattern);
+        pattern = vqtbl1q_u8(pattern, rotate);
+        vst1q_u8(dst.add(16), pattern);
+        if len > 32 {
+            pattern = vqtbl1q_u8(pattern, rotate);
+            vst1q_u8(dst.add(32), pattern);
+            pattern = vqtbl1q_u8(pattern, rotate);
+            vst1q_u8(dst.add(48), pattern);
+        }
+    }
+}
+
+/// For each offset below 16, the lane of `copy_pattern_neon`'s byte
+/// register that holds each of the first 16 bytes of the pattern.
+#[cfg(all(target_arch = "aarch64", not(miri)))]
+static PATTERN_LANES: [[u8; 16]; 16] = {
+    let mut lanes = [[0u8; 16]; 16];
+    let mut offset = 1;
+    while offset < 16 {
+        let mut i = 0;
+        while i < 16 {
+            let k = i % offset;
+            lanes[offset][i] = if k < 8 { k } else { k + 16 - offset } as u8;
+            i += 1;
+        }
+        offset += 1;
+    }
+    lanes
+};
+
+/// For each offset below 16, the lookup that turns 16 bytes of the pattern
+/// into the next 16.
+#[cfg(all(target_arch = "aarch64", not(miri)))]
+static PATTERN_ROTATE: [[u8; 16]; 16] = {
+    let mut rotate = [[0u8; 16]; 16];
+    let mut offset = 1;
+    while offset < 16 {
+        let mut i = 0;
+        while i < 16 {
+            rotate[offset][i] = ((i + 16) % offset) as u8;
+            i += 1;
+        }
+        offset += 1;
+    }
+    rotate
+};
 
 /// Writes whole periods of the `offset` bytes before `before` at `dst`, for
 /// `W <= offset < 2 * W`, as a `W`-byte head and a `W`-byte tail each.
