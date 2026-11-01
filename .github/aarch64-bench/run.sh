@@ -28,15 +28,10 @@ for t in head base; do
   (cd "$dir" && SNAPPY_CPP_PREFIX=$SNAPPY cargo build --release -q --example compare --target-dir "$W/target-$t")
   cp "$W/target-$t/release/examples/compare" "$W/compare-$t"
 done
-for round in 1 2; do
+for round in 1; do
   for t in head base; do
     echo "-- $t (round $round)"
     SNIPSNAP_PARQUET_BENCH=$HITS taskset -c $CPU "$W/compare-$t" --decode --samples 10 | tail -26
   done
 done
-echo "-- head, encode"
-SNIPSNAP_PARQUET_BENCH=$HITS taskset -c $CPU "$W/compare-head" --encode --samples 6 | tail -26
-
 fi
-echo "-- base, encode"
-SNIPSNAP_PARQUET_BENCH=$HITS taskset -c $CPU "$W/compare-base" --encode --samples 6 | tail -26

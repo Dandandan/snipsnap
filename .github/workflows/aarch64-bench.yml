@@ -15,9 +15,11 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
       - name: Build C++ snappy with clang
         run: |
-          sudo apt-get install -y -q clang cmake
+          sudo apt-get install -y -q clang cmake bolt-18
           sudo apt-get install -y -q linux-tools-common "linux-tools-$(uname -r)" || true
           echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
           git clone -q https://github.com/google/snappy.git "$RUNNER_TEMP/snappy-src"
@@ -29,7 +31,9 @@ jobs:
       - name: Download a ClickBench partition
         run: curl -sSfL -o "$RUNNER_TEMP/hits_0.parquet" https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
       - name: Benchmark
-        run: .github/aarch64-bench/run.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/work" 2>&1 | tee "$RUNNER_TEMP/bench.txt"
+        run: |
+          .github/aarch64-bench/run.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/work" 2>&1 | tee "$RUNNER_TEMP/bench.txt"
+          .github/aarch64-bench/pgo-bolt.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/pb" 2>&1 | tee -a "$RUNNER_TEMP/bench.txt"
       - uses: actions/upload-artifact@v4
         with:
           name: bench
