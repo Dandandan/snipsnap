@@ -13,7 +13,7 @@ REPO=$(git rev-parse --show-toplevel)
 CPU=${CPU:-1}
 SYSROOT_BIN=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
 PROFDATA=${LLVM_PROFDATA:-$SYSROOT_BIN/llvm-profdata}
-BOLT_DIR=${BOLT_DIR:-$(dirname "$(ls /usr/lib/llvm-*/bin/llvm-bolt 2>/dev/null | tail -1)")}
+BOLT_DIR=${BOLT_DIR:-$(dirname "$(ls /usr/lib/llvm-*/bin/llvm-bolt 2>/dev/null | tail -1 || true)")}
 export LD_LIBRARY_PATH="$SNAPPY/lib" SNIPSNAP_PARQUET_BENCH=$HITS SNAPPY_CPP_PREFIX=$SNAPPY
 mkdir -p "$W"
 RELOCS="-Clink-args=-Wl,--emit-relocs"
