@@ -366,12 +366,24 @@ fn small_block_copies_match_snap() {
 fn runs_of_identical_copies_match_snap() {
     // Runs of identical copy-2 tags, which the decoder fills period by
     // period, at every period it batches and lengths that end each fill
-    // block at a different point.
+    // block at a different point. The literal before them varies in length,
+    // so runs start at every alignment, and the run lengths fall on both
+    // sides of where long runs switch to aligned stores.
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let step = if cfg!(miri) { 7 } else { 1 };
-    for period in (8..=120).step_by(step) {
-        for (len, count) in [(64, 2), (64, 9), (61, 5), (17, 12), (40, 31)] {
-            let mut expected: Vec<u8> = (0..200).map(|_| rng.next() as u8).collect();
+    for period in (1..=120).step_by(step) {
+        for (len, count) in [
+            (64, 2),
+            (64, 3),
+            (64, 4),
+            (64, 9),
+            (61, 5),
+            (17, 12),
+            (8, 33),
+            (40, 31),
+        ] {
+            let prefix = 200 + rng.below(64);
+            let mut expected: Vec<u8> = (0..prefix).map(|_| rng.next() as u8).collect();
             let mut body = Vec::new();
             literal(&expected, &mut body);
             for _ in 0..count {

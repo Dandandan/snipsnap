@@ -735,9 +735,50 @@ unsafe fn fill_periodic(start: *mut u8, offset: usize, total: usize) {
             copy_overlapping(start, start, offset, block);
         }
         let mut pos = block;
-        while pos < total {
+        if total < 256 {
+            while pos < total {
+                copy_16_to_64(start, start.add(pos), block);
+                pos += block;
+            }
+            return;
+        }
+        // Long runs are written in 64-byte-aligned blocks, each copied from
+        // the offset in the pattern where it starts. Copying the block to
+        // `start + block`, `start + 2 * block` and so on instead split one
+        // 16-byte store in four across cache lines unless `start` was
+        // 16-byte aligned and the block 64 bytes, and even then it ran at
+        // half speed in some allocations: runs of one, three or eight bytes
+        // and 16-byte periods decoded half as fast.
+        //
+        // The pattern is first extended far enough that every source block
+        // lies before the first aligned block, which may start up to 63
+        // bytes before `pos` and rewrites those bytes with their own values.
+        // The offset of each source block in the pattern, `phase`, advances
+        // by `64 % offset` from one block to the next.
+        while pos < offset + 127 {
             copy_16_to_64(start, start.add(pos), block);
             pos += block;
+        }
+        let end = start.add(total);
+        let mut dst = start.add(pos);
+        dst = dst.sub(dst.addr() % 64);
+        let mut phase = dst.offset_from(start) as usize % offset;
+        let step = 64 % offset;
+        if step == 0 {
+            let source = start.add(phase);
+            while dst < end {
+                copy_16_to_64(source, dst, 64);
+                dst = dst.add(64);
+            }
+            return;
+        }
+        while dst < end {
+            copy_16_to_64(start.add(phase), dst, 64);
+            dst = dst.add(64);
+            phase += step;
+            if phase >= offset {
+                phase -= offset;
+            }
         }
     }
 }
