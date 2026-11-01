@@ -62,7 +62,7 @@ Most of the lead comes from integer columns, run-length-like data and
 small blocks:
 
 - Integer columns decompress 1.0–2.2x as fast as C++.
-- Periodic data decompresses 3.5–19x as fast on x86 and 2.4–3.2x on Arm.
+- Periodic data decompresses 3.5–19x as fast on x86 and 2.5–3.2x on Arm.
 - 256-byte blocks decompress 2.9x as fast.
 
 Text, HTML, URLs and protobuf decompress 1.02–1.06x as fast as C++ on Arm
@@ -89,10 +89,12 @@ library's do not. On such a host, an earlier version of snipsnap measured
 against 3.1 GB/s on the 24 cases.
 
 Building snipsnap with profile-guided optimization or with LLVM BOLT,
-trained on the 24 cases, does not make it faster: within 1% overall on
-decompression and 1–3% slower on compression, on x86. Those builds were
-how the encoder's layout problem, and a store-alignment problem in the
-decoding of long runs, were found and fixed in the source.
+trained on the 24 cases, does not make it faster overall, on x86 or on
+Arm: decompression stays within 1% and compression is up to 3% slower.
+Individual cases do move; on Arm, BOLT compresses HTML and protobuf 11%
+faster but URLs 5% and 4 KiB blocks 7% slower. Those builds were how the
+encoder's layout problem, and a store-alignment problem in the decoding
+of long runs, were found and fixed in the source.
 
 Framed streams check every chunk's CRC-32C with the CPU's CRC instructions
 where it has them (SSE4.2 on x86, the CRC extension on Arm, detected at run
