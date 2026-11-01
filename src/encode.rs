@@ -19,6 +19,7 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use crate::bytes::{copy_16, copy_exact, read_16, read_u32, read_u64, write_u32};
+use crate::layout::align_function_64;
 use crate::select::{opaque, select_if_below_2048, select_if_low_zero};
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
 
@@ -462,6 +463,13 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
         }
     }
 
+    // The layout of the loop above decides how many of its branches cross
+    // or end on 32-byte boundaries, which costs 10-40% on cores with the JCC
+    // erratum (see `layout`). Pinning the function's alignment makes that
+    // layout independent of where the linker places it. With Rust 1.97 it
+    // made HTML and protobuf compress 40-47% faster; with Rust 1.88, whose
+    // placement was already a good one, it measured the same.
+    align_function_64();
     if ip < len {
         // SAFETY: the remaining output is covered by the bound.
         op = unsafe { emit_literal(op, base.add(ip), len - ip) };

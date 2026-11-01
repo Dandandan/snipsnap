@@ -25,6 +25,7 @@ use crate::bytes::{
     copy_16_to_64, copy_exact, copy_short, read_32, read_u16, read_u32, read_u64,
     write_16, write_32, write_u16, write_u32, write_u64,
 };
+use crate::layout::{self, align_function_64};
 use crate::select::{opaque, select_if_zero, select_ptr_if_zero};
 use crate::{Error, Result, decode_error};
 
@@ -571,35 +572,13 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
     (tag_type, select_if_zero(tag_type, next_literal, next_copy))
 }
 
-/// Aligns the start of the calling function to 64 bytes (on x86-64), so that
-/// the layout of its loops does not depend on where the linker places it.
-///
-/// That layout matters on cores with Intel's JCC erratum (Skylake to Cascade
-/// Lake and their client parts): a 32-byte block of code holding a jump that
-/// crosses or ends on its boundary is not cached as decoded micro-ops, which
-/// slowed the fast loop by 10-20% in unlucky placements. The directive raises
-/// the alignment of the function's section; it also pads to 64 bytes where it
-/// stands, so it belongs on a path that is taken once per call at most.
-#[inline(always)]
-fn align_function_64() {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    // SAFETY: an assembler directive; the padding is executed as nops.
-    unsafe {
-        std::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
-    }
-}
-
 /// In the main fast loop (`UNROLL == 2`), aligns the next instruction to 32
 /// bytes, which keeps its branches clear of 32-byte boundaries (see
 /// [`align_function_64`]).
 #[inline(always)]
 fn align_32<const UNROLL: usize>() {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
     if UNROLL == 2 {
-        // SAFETY: an assembler directive; the padding is executed as nops.
-        unsafe {
-            std::arch::asm!(".p2align 5", options(nomem, nostack, preserves_flags));
-        }
+        layout::align_32();
     }
 }
 

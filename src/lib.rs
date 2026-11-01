@@ -12,6 +12,7 @@ use std::slice;
 mod bytes;
 mod decode;
 mod encode;
+mod layout;
 mod select;
 
 const MAX_BLOCK_LEN: u64 = u32::MAX as u64;
