@@ -1,9 +1,0 @@
-[package]
-name = "pqdump"
-version = "0.1.0"
-edition = "2024"
-[dependencies]
-parquet = { version = "58.3.0", default-features = false }
-thrift = "0.17"
-snap = "1.1.1"
-[workspace]
