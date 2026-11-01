@@ -735,7 +735,11 @@ unsafe fn fill_periodic(start: *mut u8, offset: usize, total: usize) {
             copy_overlapping(start, start, offset, block);
         }
         let mut pos = block;
-        if total < 256 {
+        // On aarch64 (Neoverse-N2) the unaligned stores cost little, and
+        // advancing the phase of the aligned blocks cost periods of three
+        // bytes 6%, so there only periods that divide 64 take the aligned
+        // path, which needs no phase.
+        if total < 256 || (cfg!(target_arch = "aarch64") && 64 % offset != 0) {
             while pos < total {
                 copy_16_to_64(start, start.add(pos), block);
                 pos += block;
