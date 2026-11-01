@@ -21,8 +21,13 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q clang cmake
-          sudo apt-get install -y -q bolt-18 || sudo apt-get install -y -q bolt-17 || true
-          ls /usr/lib/llvm-*/bin/llvm-bolt || true
+          # Ubuntu's arm64 archive has no BOLT package; apt.llvm.org does.
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          for v in 21 20 19; do
+            echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$v main" | sudo tee /etc/apt/sources.list.d/llvm.list
+            if sudo apt-get update -q > /dev/null && sudo apt-get install -y -q "bolt-$v"; then break; fi
+          done
+          ls /usr/lib/llvm-*/bin/llvm-bolt /usr/lib/llvm-*/lib/libbolt_rt_instr.a || true
           sudo apt-get install -y -q linux-tools-common "linux-tools-$(uname -r)" || true
           echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
           git clone -q https://github.com/google/snappy.git "$RUNNER_TEMP/snappy-src"
@@ -35,8 +40,9 @@ jobs:
         run: curl -sSfL -o "$RUNNER_TEMP/hits_0.parquet" https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
       - name: Benchmark
         run: |
-          .github/aarch64-bench/run.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/work" 2>&1 | tee "$RUNNER_TEMP/bench.txt"
-          .github/aarch64-bench/pgo-bolt.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/pb" 2>&1 | tee -a "$RUNNER_TEMP/bench.txt"
+          lscpu | grep -E "Model name|Vendor" || true; rustc --version
+          EXTRA="alignloops32:-Cllvm-args=-align-loops=32;alignloops64:-Cllvm-args=-align-loops=64" \
+            .github/aarch64-bench/pgo-bolt.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/pb" 2>&1 | tee "$RUNNER_TEMP/bench.txt"
       - uses: actions/upload-artifact@v4
         with:
           name: bench
