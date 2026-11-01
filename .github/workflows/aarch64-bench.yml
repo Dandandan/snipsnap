@@ -19,7 +19,10 @@ jobs:
           components: llvm-tools
       - name: Build C++ snappy with clang
         run: |
-          sudo apt-get install -y -q clang cmake bolt-18
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang cmake
+          sudo apt-get install -y -q bolt-18 || sudo apt-get install -y -q bolt-17 || true
+          ls /usr/lib/llvm-*/bin/llvm-bolt || true
           sudo apt-get install -y -q linux-tools-common "linux-tools-$(uname -r)" || true
           echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
           git clone -q https://github.com/google/snappy.git "$RUNNER_TEMP/snappy-src"

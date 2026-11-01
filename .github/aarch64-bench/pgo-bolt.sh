@@ -13,7 +13,7 @@ REPO=$(git rev-parse --show-toplevel)
 CPU=${CPU:-1}
 SYSROOT_BIN=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
 PROFDATA=${LLVM_PROFDATA:-$SYSROOT_BIN/llvm-profdata}
-BOLT_DIR=${BOLT_DIR:-/usr/lib/llvm-18/bin}
+BOLT_DIR=${BOLT_DIR:-$(dirname "$(ls /usr/lib/llvm-*/bin/llvm-bolt 2>/dev/null | tail -1)")}
 export LD_LIBRARY_PATH="$SNAPPY/lib" SNIPSNAP_PARQUET_BENCH=$HITS SNAPPY_CPP_PREFIX=$SNAPPY
 mkdir -p "$W"
 RELOCS="-Clink-args=-Wl,--emit-relocs"
@@ -37,11 +37,17 @@ echo "== PGO"
 rm -rf "$W/pgo-raw"; GEN=$(build t-pgo-gen "-Cprofile-generate=$W/pgo-raw $RELOCS")
 train "$GEN"; "$PROFDATA" merge -o "$W/pgo.profdata" "$W"/pgo-raw/*.profraw
 PGO=$(build t-pgo "-Cprofile-use=$W/pgo.profdata -Cllvm-args=-no-pgo-warn-mismatch $RELOCS")
-echo "== BOLT"; bolt "$PLAIN" "$W/compare.bolt"
-echo "== PGO+BOLT"; bolt "$PGO" "$W/compare.pgo.bolt"
+BUILDS="$PLAIN:plain $PGO:pgo"
+if [ -x "$BOLT_DIR/llvm-bolt" ]; then
+  echo "== BOLT ($BOLT_DIR)"; bolt "$PLAIN" "$W/compare.bolt"
+  echo "== PGO+BOLT"; bolt "$PGO" "$W/compare.pgo.bolt"
+  BUILDS="$BUILDS $W/compare.bolt:bolt $W/compare.pgo.bolt:pgo+bolt"
+else
+  echo "== no llvm-bolt found; skipping BOLT"
+fi
 [ -n "${NOBENCH:-}" ] && exit 0
 for round in 1 2; do
-  for b in "$PLAIN:plain" "$PGO:pgo" "$W/compare.bolt:bolt" "$W/compare.pgo.bolt:pgo+bolt"; do
+  for b in $BUILDS; do
     echo "-- ${b##*:} decode (round $round)"; taskset -c $CPU "${b%:*}" --decode --samples 10 | tail -26
     echo "-- ${b##*:} encode (round $round)"; taskset -c $CPU "${b%:*}" --encode --samples 6 | tail -26
   done
