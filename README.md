@@ -53,16 +53,16 @@ snappy 1.3.1 built with clang 18:
 
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
-| decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 5.8 GB/s | 3.4 GB/s | 4.2 GB/s |
+| decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 6.6 GB/s | 3.3 GB/s | 4.3 GB/s |
 | decompress, Arm Neoverse-N2 (GitHub's Arm runner) | 8.7 GB/s | 4.6 GB/s | 6.9 GB/s |
-| compress, Intel Xeon | 2.3 GB/s | 2.1 GB/s | 2.2 GB/s |
+| compress, Intel Xeon | 2.5 GB/s | 2.0 GB/s | 2.2 GB/s |
 | compress, Arm Neoverse-N2 | 3.1 GB/s | 2.6 GB/s | 2.9 GB/s |
 
 Most of the lead comes from integer columns, run-length-like data and
 small blocks:
 
 - Integer columns decompress 1.0–2.2x as fast as C++.
-- Periodic data decompresses 1.6–9.7x as fast on x86 and 2.4–3.2x on Arm.
+- Periodic data decompresses 3.5–19x as fast on x86 and 2.4–3.2x on Arm.
 - 256-byte blocks decompress 2.9x as fast.
 
 Text, HTML, URLs and protobuf decompress 1.02–1.06x as fast as C++ on Arm
@@ -80,11 +80,19 @@ of the queries, are most of that work.
 On Intel cores from Skylake to Cascade Lake with Intel's microcode update
 for the JCC erratum, a 32-byte block of code holding a branch that crosses
 or ends on its boundary is decoded again on every pass. That slowed the
-decoders' main loops by 10–20%, depending on where the linker placed them.
-snipsnap's loop is aligned so that its branches stay clear of those
-boundaries; three of the C++ library's do not. On such a host, an earlier
-version of snipsnap measured 1.21x as fast as C++ on the query-weighted
-ClickBench pages, and 5.1 GB/s against 3.1 GB/s on the 24 cases.
+decoder's main loop by 10–20%, and the encoder's HTML and protobuf
+compression by up to 47%, depending on where the linker placed them. Both
+loops are aligned so that their layout does not depend on the linker; the
+decoder's branches stay clear of those boundaries, and three of the C++
+library's do not. On such a host, an earlier version of snipsnap measured
+1.21x as fast as C++ on the query-weighted ClickBench pages, and 5.1 GB/s
+against 3.1 GB/s on the 24 cases.
+
+Building snipsnap with profile-guided optimization or with LLVM BOLT,
+trained on the 24 cases, does not make it faster: within 1% overall on
+decompression and 1–3% slower on compression, on x86. Those builds were
+how the encoder's layout problem, and a store-alignment problem in the
+decoding of long runs, were found and fixed in the source.
 
 Framed streams check every chunk's CRC-32C with the CPU's CRC instructions
 where it has them (SSE4.2 on x86, the CRC extension on Arm, detected at run
