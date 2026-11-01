@@ -8,6 +8,8 @@
 #   BOLT_DIR       directory with llvm-bolt and merge-fdata (default /usr/lib/llvm-18/bin)
 #   CPU            core to pin to (default 1)
 #   EXTRA          more plain builds, as "name:rustflags;name:rustflags"
+#   SKIP_PGO       skip the PGO and PGO+BOLT builds
+#   DUMP           print the disassembly of matching functions, plain and BOLT
 set -euo pipefail
 SNAPPY=$(realpath "$1"); HITS=$(realpath "$2"); W=$(realpath -m "$3")
 REPO=$(git rev-parse --show-toplevel); HERE="$REPO/.github/aarch64-bench"
@@ -35,16 +37,29 @@ bolt() { # bolt INPUT OUTPUT; returns non-zero if BOLT fails
   grep -E "BOLT-INFO: .*(functions with profile|basic block reordering)" "$W/bolt-opt.log" | head -3 || true
 }
 echo "== plain"; PLAIN=$(build t-plain "$RELOCS")
-echo "== PGO"
-rm -rf "$W/pgo-raw"; GEN=$(build t-pgo-gen "-Cprofile-generate=$W/pgo-raw $RELOCS")
-train "$GEN"; "$PROFDATA" merge -o "$W/pgo.profdata" "$W"/pgo-raw/*.profraw
-PGO=$(build t-pgo "-Cprofile-use=$W/pgo.profdata -Cllvm-args=-no-pgo-warn-mismatch $RELOCS")
-BUILDS="$PLAIN:plain $PGO:pgo"
+BUILDS="$PLAIN:plain"
+if [ -z "${SKIP_PGO:-}" ]; then
+  echo "== PGO"
+  rm -rf "$W/pgo-raw"; GEN=$(build t-pgo-gen "-Cprofile-generate=$W/pgo-raw $RELOCS")
+  train "$GEN"; "$PROFDATA" merge -o "$W/pgo.profdata" "$W"/pgo-raw/*.profraw
+  PGO=$(build t-pgo "-Cprofile-use=$W/pgo.profdata -Cllvm-args=-no-pgo-warn-mismatch $RELOCS")
+  BUILDS="$BUILDS $PGO:pgo"
+fi
 if [ -x "$BOLT_DIR/llvm-bolt" ]; then
   echo "== BOLT ($BOLT_DIR)"
   bolt "$PLAIN" "$W/compare.bolt" && BUILDS="$BUILDS $W/compare.bolt:bolt"
-  echo "== PGO+BOLT"
-  bolt "$PGO" "$W/compare.pgo.bolt" && BUILDS="$BUILDS $W/compare.pgo.bolt:pgo+bolt"
+  if [ -n "${DUMP:-}" ] && [ -x "$W/compare.bolt" ]; then
+    # Disassembly of the functions matching DUMP, as BOLT laid them out
+    # (hot part and split-off cold fragments) and in the plain build.
+    for bin in "$W/compare.bolt" "$PLAIN"; do
+      echo "== disassembly of $DUMP in $bin"
+      objdump -d --no-show-raw-insn "$bin" | awk -v pat="$DUMP" '$0 ~ "^[0-9a-f]+ <.*" pat {p=1} p && /^$/ {p=0} p'
+    done
+  fi
+  if [ -z "${SKIP_PGO:-}" ]; then
+    echo "== PGO+BOLT"
+    bolt "$PGO" "$W/compare.pgo.bolt" && BUILDS="$BUILDS $W/compare.pgo.bolt:pgo+bolt"
+  fi
 else
   echo "== no llvm-bolt found; skipping BOLT"
 fi

@@ -41,7 +41,7 @@ jobs:
       - name: Benchmark
         run: |
           lscpu | grep -E "Model name|Vendor" || true; rustc --version
-          EXTRA="alignloops32:-Cllvm-args=-align-loops=32;alignloops64:-Cllvm-args=-align-loops=64" \
+          SKIP_PGO=1 DUMP=8snipsnap6encode14compress_block \
             .github/aarch64-bench/pgo-bolt.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/pb" 2>&1 | tee "$RUNNER_TEMP/bench.txt"
       - uses: actions/upload-artifact@v4
         with:

@@ -471,11 +471,6 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
     // made HTML and protobuf compress 40-47% faster; with Rust 1.88, whose
     // placement was already a good one, it measured the same.
     align_function_64();
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: an assembler directive; the padding is executed as nops.
-    unsafe {
-        std::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
-    }
     if ip < len {
         // SAFETY: the remaining output is covered by the bound.
         op = unsafe { emit_literal(op, base.add(ip), len - ip) };
@@ -612,6 +607,7 @@ unsafe fn emit_literal_fast(op: *mut u8, literal: *const u8, len: usize) -> *mut
     debug_assert!(len > 0);
     unsafe {
         if len <= 16 {
+            cold_hint();
             *op = ((len - 1) << 2) as u8;
             copy_16(literal, op.add(1));
             return op.add(1 + len);
