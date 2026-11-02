@@ -1,22 +1,29 @@
-//! Code alignment for Intel's JCC erratum.
+//! Code alignment, against Intel's JCC erratum and for a stable layout on
+//! aarch64.
 //!
 //! On cores from Skylake to Cascade Lake with Intel's microcode update, a
 //! 32-byte block of code holding a jump that crosses or ends on its boundary
 //! is not cached as decoded micro-ops. Hot loops with such jumps ran 10-20%
 //! slower in the decoder, and the encoder compressed HTML and protobuf up to
 //! 47% slower, depending only on where the linker placed them. These
-//! directives pin the layout of the functions and loops that use them. They
-//! are no-ops on other architectures and under Miri.
+//! directives pin the layout of the functions and loops that use them.
+//!
+//! aarch64 functions are only aligned to 4 bytes, so there the layout of
+//! the decoder's main loop also moved with unrelated code: pinning it made
+//! text decode 4% faster on Neoverse-N2, at every one of the 16 offsets of
+//! the loop within its 64 bytes that were tried. The directives are no-ops
+//! on other architectures and under Miri.
 
-/// Aligns the start of the calling function to 64 bytes (on x86-64), so that
-/// the layout of its loops does not depend on where the linker places it.
+/// Aligns the start of the calling function to 64 bytes (on x86-64 and
+/// aarch64), so that the layout of its loops does not depend on where the
+/// linker places it.
 ///
 /// The directive raises the alignment of the function's section; it also
 /// pads to 64 bytes where it stands, so it belongs on a path that is taken
 /// once per call at most.
 #[inline(always)]
 pub(crate) fn align_function_64() {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri)))]
     // SAFETY: an assembler directive; the padding is executed as nops.
     unsafe {
         std::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
