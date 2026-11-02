@@ -20,7 +20,7 @@ use std::ptr;
 
 use crate::bytes::{copy_16, copy_exact, read_16, read_u32, read_u64, write_u32};
 use crate::layout::align_function_64;
-use crate::select::{opaque, select_copy_encoding, select_if_low_zero};
+use crate::select::{opaque, select_if_below_2048, select_if_low_zero};
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
 
 /// Input is compressed in independent blocks of this size.
@@ -693,9 +693,10 @@ unsafe fn emit_copy_at_most_64<const SHORT: bool>(
             // otherwise turn the selects into a branch.
             let copy1 = 1u32.wrapping_sub(4 << 2).wrapping_add((offset >> 3) & 0xe0);
             let copy2 = 2u32.wrapping_sub(1 << 2);
-            let (tag, size) = select_copy_encoding(offset, copy1, copy2);
-            write_u32(op, ((len << 2) + (offset << 8)).wrapping_add(tag));
-            op.add(size)
+            let u = ((len << 2) + (offset << 8))
+                .wrapping_add(select_if_below_2048(offset, copy1, copy2));
+            write_u32(op, u);
+            op.add(2 + usize::from(offset >= 2048))
         } else {
             write_u32(op, 2 + ((len - 1) << 2) + (offset << 8));
             op.add(3)
@@ -713,6 +714,9 @@ unsafe fn emit_copy_at_most_64<const SHORT: bool>(
 unsafe fn emit_copy(mut op: *mut u8, offset: usize, mut len: usize) -> *mut u8 {
     debug_assert!(len >= 12);
     unsafe {
+        if len <= 64 {
+            return emit_copy_at_most_64::<false>(op, offset, len);
+        }
         // Keep at least four bytes for the last copy.
         while len >= 68 {
             op = emit_copy_at_most_64::<false>(op, offset, 64);
@@ -723,7 +727,17 @@ unsafe fn emit_copy(mut op: *mut u8, offset: usize, mut len: usize) -> *mut u8 {
             len -= 60;
         }
         if len < 12 {
-            emit_copy_at_most_64::<true>(op, offset, len)
+            // Written apart from `emit_copy_at_most_64`, so that LLVM does
+            // not merge it with the common short copies' code and put that
+            // behind jumps.
+            let (offset, len) = (offset as u32, len as u32);
+            if offset < 2048 {
+                write_u32(op, 1 + ((len - 4) << 2) + ((offset >> 8) << 5) + (offset << 8));
+                op.add(2)
+            } else {
+                write_u32(op, 2 + ((len - 1) << 2) + (offset << 8));
+                op.add(3)
+            }
         } else {
             emit_copy_at_most_64::<false>(op, offset, len)
         }
