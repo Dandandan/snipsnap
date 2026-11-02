@@ -8,6 +8,7 @@
 #   ROUNDS    benchmark rounds (default 3)
 #   CPU       core to pin to (default 1)
 #   OPS       "decode encode" (default) or one of them
+#   VARIANTS  glob of the variants/ directories to include (default all)
 set -euo pipefail
 SNAPPY=$(realpath "$1"); HITS=$(realpath "$2"); W=$(realpath -m "$3")
 REPO=$(git rev-parse --show-toplevel)
@@ -18,7 +19,7 @@ IFS=';' read -ra targets <<< "${TARGETS:-plain:}"
 # Each variants/NAME/ holds files that replace the same paths under src/ at
 # HEAD, benchmarked as one more side.
 SIDES="base head"
-for d in "$REPO"/.github/aarch64-bench/variants/*/; do
+for d in "$REPO"/.github/aarch64-bench/variants/${VARIANTS:-*}/; do
   [ -d "$d" ] && SIDES="$SIDES $(basename "$d")"
 done
 for side in $SIDES; do

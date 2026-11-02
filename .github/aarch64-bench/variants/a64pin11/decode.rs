@@ -288,6 +288,11 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
 ) -> (usize, usize) {
     const { assert!(UNROLL == 1 || (UNROLL == 2 && WIDE)) };
     debug_assert!(ip < ip_limit && op < op_limit);
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if UNROLL == 2 {
+        // SAFETY: padding executed once per call.
+        unsafe { std::arch::asm!(".rept 11", "nop", ".endr", options(nomem, nostack, preserves_flags)) };
+    }
     // SAFETY: `ip < ip_limit` and `op < op_limit`, so all four are in bounds.
     // From here on `ip` points just past the tag being decoded. The output
     // position is kept as a pointer so that stores use simple addressing.
@@ -459,9 +464,6 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
 
     'outer: loop {
         align_32::<UNROLL>();
-        if WIDE {
-            prefetch(ip.wrapping_add(128));
-        }
         step!('outer);
         if UNROLL == 2 {
             align_32::<UNROLL>();
@@ -477,6 +479,9 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     }
     if UNROLL == 2 {
         align_function_64();
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        // SAFETY: an assembler directive.
+        unsafe { std::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags)) };
     }
     // SAFETY: as in the loop.
     unsafe {
@@ -589,26 +594,6 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
         select_if_zero(tag_type, next_literal, next_copy),
         advance,
     )
-}
-
-/// Asks for the cache line at `p` to be loaded, as the C++ library does for
-/// the input 128 bytes ahead. A prefetch never faults, so `p` may be past
-/// the end of the input.
-#[inline(always)]
-fn prefetch(p: *const u8) {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    // SAFETY: a prefetch does not access memory.
-    unsafe {
-        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-        _mm_prefetch::<_MM_HINT_T0>(p.cast());
-    }
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    // SAFETY: a prefetch does not access memory.
-    unsafe {
-        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags));
-    }
-    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
-    let _ = p;
 }
 
 /// In the main fast loop (`UNROLL == 2`), aligns the next instruction to 32
