@@ -12,10 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-24.04-arm, variants: "a64pin*", rounds: 2, n: 1}
-          - {os: ubuntu-24.04, variants: avxfast, rounds: 4, n: 1}
-          - {os: ubuntu-24.04, variants: avxfast, rounds: 4, n: 2}
-          - {os: ubuntu-24.04, variants: avxfast, rounds: 4, n: 3}
+          - {os: ubuntu-24.04-arm, n: 1}
+          - {os: ubuntu-24.04, n: 1}
+          - {os: ubuntu-24.04, n: 2}
+          - {os: ubuntu-24.04, n: 3}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 80
     steps:
@@ -38,5 +38,5 @@ jobs:
       - name: Benchmark
         run: |
           lscpu | grep -E "Model name|Vendor" || true; rustc --version
-          BASE_REF=6e43550 OPS=decode ROUNDS=${{ matrix.rounds }} VARIANTS="${{ matrix.variants }}" \
+          BASE_REF=6e43550 ROUNDS=3 \
             .github/aarch64-bench/ab.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/ab" 2>&1
