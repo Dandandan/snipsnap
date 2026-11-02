@@ -7,6 +7,7 @@
 #   TARGETS   "name:rustflags;name:rustflags" (default "plain:")
 #   ROUNDS    benchmark rounds (default 3)
 #   CPU       core to pin to (default 1)
+#   OPS       "decode encode" (default) or one of them
 set -euo pipefail
 SNAPPY=$(realpath "$1"); HITS=$(realpath "$2"); W=$(realpath -m "$3")
 REPO=$(git rev-parse --show-toplevel)
@@ -29,10 +30,10 @@ for round in $(seq "$ROUNDS"); do
   for t in "${targets[@]}"; do
     for side in base head; do
       b="$side-${t%%:*}"
-      echo "-- $b decode (round $round)"
-      taskset -c "$CPU" "$W/compare-$b" --decode --samples 10 | tail -26
-      echo "-- $b encode (round $round)"
-      taskset -c "$CPU" "$W/compare-$b" --encode --samples 6 | tail -26
+      for op in ${OPS:-decode encode}; do
+        echo "-- $b $op (round $round)"
+        taskset -c "$CPU" "$W/compare-$b" --$op --samples 8 | tail -26
+      done
     done
   done
 done
