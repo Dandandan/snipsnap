@@ -12,8 +12,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-24.04-arm, n: 1, targets: "plain:;neoverse-n2:-Ctarget-cpu=neoverse-n2;align:-Cllvm-args=-align-all-functions=4 -Cllvm-args=-align-loops=32"}
-          - {os: ubuntu-24.04-arm, n: 2, targets: "plain:;neoverse-n2:-Ctarget-cpu=neoverse-n2;align:-Cllvm-args=-align-all-functions=4 -Cllvm-args=-align-loops=32"}
+          - {os: ubuntu-24.04, n: 1, ops: encode, variants: boff, targets: "plain:;v2:-Ctarget-cpu=x86-64-v2;bmi2:-Ctarget-feature=+bmi2"}
+          - {os: ubuntu-24.04, n: 2, ops: encode, variants: boff, targets: "plain:;v2:-Ctarget-cpu=x86-64-v2;bmi2:-Ctarget-feature=+bmi2"}
+          - {os: ubuntu-24.04, n: 3, ops: decode, variants: avx512, targets: "plain:;bmi2:-Ctarget-feature=+bmi2"}
+          - {os: ubuntu-24.04, n: 4, ops: decode, variants: avx512, targets: "plain:;bmi2:-Ctarget-feature=+bmi2"}
+          - {os: ubuntu-24.04, n: 5, ops: decode, variants: avx512, targets: "plain:;bmi2:-Ctarget-feature=+bmi2"}
+          - {os: ubuntu-24.04-arm, n: 1, ops: encode, variants: boff, targets: "plain:;crc:-Ctarget-feature=+crc"}
+          - {os: macos-15, n: 1, ops: encode, variants: boff, targets: "plain:"}
+          - {os: macos-15, n: 2, ops: encode, variants: boff, targets: "plain:"}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -38,6 +44,13 @@ jobs:
         run: curl -sSfL -o "$RUNNER_TEMP/hits_0.parquet" https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
       - name: Benchmark
         run: |
-          (lscpu | grep -E "Model name|Vendor") 2>/dev/null || sysctl -n machdep.cpu.brand_string || true
-          TARGETS="${{ matrix.targets }}" VARIANTS=none ROUNDS=3 \
+          (lscpu | grep -E "Model name|Vendor|Flags") 2>/dev/null || sysctl -n machdep.cpu.brand_string || true
+          TARGETS="${{ matrix.targets }}" VARIANTS="${{ matrix.variants }}" OPS="${{ matrix.ops }}" ROUNDS=3 \
             bash .github/aarch64-bench/ab.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/ab" 2>&1
+      - name: Compressed bytes against C++
+        run: |
+          export DYLD_LIBRARY_PATH="$RUNNER_TEMP/snappy/lib" LD_LIBRARY_PATH="$RUNNER_TEMP/snappy/lib"
+          for b in "$RUNNER_TEMP"/ab/compare-*; do
+            out=$("$b" --identical | grep "differ" || true)
+            echo "== identical $(basename "$b"): $(echo "$out" | grep -vc " 0 of" || true) of $(echo "$out" | grep -c . || true) cases differ from C++"
+          done
