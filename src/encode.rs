@@ -18,9 +18,7 @@
 use std::mem::MaybeUninit;
 use std::ptr;
 
-#[cfg(not(target_arch = "x86_64"))]
-use crate::bytes::read_16;
-use crate::bytes::{copy_16, copy_exact, read_u32, read_u64, write_u32};
+use crate::bytes::{copy_16, copy_exact, read_16, read_u32, read_u64, write_u32};
 use crate::layout::align_function_64;
 use crate::select::{opaque, select_if_below_2048, select_if_low_zero};
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
@@ -542,8 +540,16 @@ unsafe fn find_match_length(
             // bytes past `p2 + matched`.
             let limit_16 = limit.saturating_sub(7);
             while matched < limit_16 {
-                if let Some(i) = first_difference_16(s1.add(matched), p2.add(matched)) {
-                    matched += i;
+                if read_16(s1.add(matched)) != read_16(p2.add(matched)) {
+                    let low = read_u64(s1.add(matched)) ^ read_u64(p2.add(matched));
+                    let high =
+                        read_u64(s1.add(matched + 8)) ^ read_u64(p2.add(matched + 8));
+                    let bits = if low != 0 {
+                        low.trailing_zeros()
+                    } else {
+                        64 + high.trailing_zeros()
+                    };
+                    matched += (bits >> 3) as usize;
                     *data = read_u64(p2.add(matched));
                     return (matched, false);
                 }
@@ -587,52 +593,6 @@ unsafe fn find_match_length(
 /// Matches are compared 8 bytes at a time up to this length, and 16 at a
 /// time after it.
 const LONG_MATCH: usize = 64;
-
-/// Returns the index of the first byte that differs between the 16 bytes at
-/// `a` and at `b`, if any.
-///
-/// # Safety
-///
-/// `a` and `b` must be readable for 16 bytes.
-#[inline(always)]
-unsafe fn first_difference_16(a: *const u8, b: *const u8) -> Option<usize> {
-    // On x86, LLVM compiles a comparison of two 16-byte arrays to `ptest`
-    // when SSE4.1 is enabled (as with `-Ctarget-cpu=x86-64-v2` and up): two
-    // micro-ops that do not fuse with the branch. That made long matches
-    // 12-17% slower to compress than the SSE2 `pmovmskb` and `cmp` it uses
-    // otherwise, which this keeps for every target CPU.
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
-        // SAFETY: SSE2 is part of x86-64, and the reads are as documented.
-        let equal = unsafe {
-            _mm_movemask_epi8(_mm_cmpeq_epi8(
-                _mm_loadu_si128(a.cast()),
-                _mm_loadu_si128(b.cast()),
-            ))
-        } as u32;
-        if equal == 0xffff {
-            None
-        } else {
-            Some((!equal).trailing_zeros() as usize)
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    // SAFETY: as documented above.
-    unsafe {
-        if read_16(a) == read_16(b) {
-            return None;
-        }
-        let low = read_u64(a) ^ read_u64(b);
-        let high = read_u64(a.add(8)) ^ read_u64(b.add(8));
-        let bits = if low != 0 {
-            low.trailing_zeros()
-        } else {
-            64 + high.trailing_zeros()
-        };
-        Some((bits >> 3) as usize)
-    }
-}
 
 /// Emits a literal inside the main loop, where up to 15 bytes may be read
 /// past it and written past its end.

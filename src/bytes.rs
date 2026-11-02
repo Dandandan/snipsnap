@@ -36,7 +36,6 @@ pub(crate) unsafe fn write_u64(ptr: *mut u8, value: u64) {
     unsafe { ptr::write_unaligned(ptr.cast::<u64>(), value.to_le()) }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 pub(crate) unsafe fn read_16(ptr: *const u8) -> [u8; 16] {
     unsafe { ptr::read_unaligned(ptr.cast::<[u8; 16]>()) }
