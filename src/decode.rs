@@ -331,7 +331,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             // `TAG_READ_SLOP` of the tag, and in the narrow loop within
             // `FAST_COPY + 2`: longer literals are left to the careful path,
             // so their next tag is not needed.
-            let (tag_type, next_tag) = unsafe { next_tag::<WIDE>(ip, tag) };
+            let (tag_type, next_tag, advance) = unsafe { next_tag::<WIDE>(ip, tag) };
 
             // SAFETY: `tag` is a byte (`next_tag` hides that from LLVM), and
             // the reads are within `TAG_READ_SLOP` of the tag. The advance is
@@ -339,7 +339,6 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             // narrow loop's margin does not cover the advance of a literal it
             // leaves to the careful path, hence the wrapping add.
             let (entry, trailer, next_ip) = unsafe {
-                let advance = usize::from(*tables.advance.get_unchecked(tag));
                 (
                     isize::from(*len_minus_offset.get_unchecked(tag)),
                     if cfg!(target_arch = "x86_64") {
@@ -492,24 +491,27 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     }
 }
 
-/// Returns the type of `tag` (at `ip - 1`) and the tag that follows its
-/// element: at `ip + (tag >> 2) + 1` for a literal, at `ip + tag_type` for a
-/// copy.
+/// Returns the type of `tag` (at `ip - 1`), the tag that follows its
+/// element (at `ip + (tag >> 2) + 1` for a literal, at `ip + tag_type` for a
+/// copy) and the element's encoded size, which takes `ip` past that tag. The
+/// size is only meaningful for tags the fast loop decodes.
 ///
 /// Both candidates are loaded before selecting, which keeps the select off
-/// the load-to-load dependency chain. On x86-64 and aarch64 the select uses
+/// the load-to-load dependency chain. On x86-64 and aarch64 the selects use
 /// the flags of `tag & 3`, as in the C++ library, which saves a compare per
-/// tag.
+/// tag, and the size is computed rather than loaded from
+/// [`Tables::advance`]: one load less per tag, and a shorter chain to the
+/// next `ip`.
 ///
 /// # Safety
 ///
 /// Both candidates must be readable. Unless `WIDE`, the literal candidate is
 /// capped at `ip + FAST_COPY + 1`.
 #[inline(always)]
-unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize) {
+unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize, usize) {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     if WIDE {
-        let (tag_type, next_tag);
+        let (tag_type, next_tag, advance);
         // SAFETY: the caller guarantees both loads are in bounds.
         unsafe {
             std::arch::asm!(
@@ -517,21 +519,26 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
                 "shr {l:e}, 2",
                 "and {t:e}, 3",
                 "movzx {n:e}, byte ptr [{ip} + {t}]",
+                "lea {a:e}, [{t} + 1]",
+                "lea {b:e}, [{l} + 2]",
                 "movzx {l:e}, byte ptr [{ip} + {l} + 1]",
                 "cmovz {n:e}, {l:e}",
+                "cmovz {a:e}, {b:e}",
                 tag = in(reg) tag,
                 ip = in(reg) ip,
                 t = out(reg) tag_type,
                 n = out(reg) next_tag,
+                a = out(reg) advance,
+                b = out(reg) _,
                 l = inout(reg) tag => _,
                 options(pure, readonly, nostack),
             );
         }
-        return (tag_type, next_tag);
+        return (tag_type, next_tag, advance);
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if WIDE {
-        let (tag_type, next_tag);
+        let (tag_type, next_tag, advance);
         // The literal candidate is loaded from `ip + 1` at offset `tag >> 2`
         // rather than from `ip + (tag >> 2)` at offset 1: an add with a
         // right-shifted operand takes two cycles on Neoverse cores, while
@@ -545,18 +552,21 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
                 "ands {t}, {tag}, #3",
                 "lsr {l}, {tag}, #2",
                 "ldrb {n:w}, [{ip}, {t}]",
+                "add {a}, {l}, #2",
                 "ldrb {l:w}, [{p}, {l}]",
                 "csel {n}, {l}, {n}, eq",
+                "csinc {a}, {a}, {t}, eq",
                 tag = in(reg) tag,
                 ip = in(reg) ip,
                 t = out(reg) tag_type,
                 n = out(reg) next_tag,
+                a = out(reg) advance,
                 l = out(reg) _,
                 p = out(reg) _,
                 options(pure, readonly, nostack),
             );
         }
-        return (tag_type, next_tag);
+        return (tag_type, next_tag, advance);
     }
     let tag_type = tag & 3;
     let literal_len = if WIDE {
@@ -569,7 +579,13 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
     // SAFETY: as documented above.
     let next_literal = usize::from(unsafe { ptr::read_volatile(ip.add(literal_len)) });
     let next_copy = usize::from(unsafe { ptr::read_volatile(ip.add(tag_type)) });
-    (tag_type, select_if_zero(tag_type, next_literal, next_copy))
+    // SAFETY: `tag` is a byte.
+    let advance = usize::from(unsafe { *TABLES.advance.get_unchecked(tag) });
+    (
+        tag_type,
+        select_if_zero(tag_type, next_literal, next_copy),
+        advance,
+    )
 }
 
 /// In the main fast loop (`UNROLL == 2`), aligns the next instruction to 32
