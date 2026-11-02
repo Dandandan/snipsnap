@@ -420,12 +420,26 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                                 let dword = if i == 0 { preload } else { data as u32 };
                                 let entry = table.byte_add(hash(dword, mask));
                                 candidate = usize::from(*entry);
-                                *entry = (ip + i) as u16;
+                                let pos = ip + i;
+                                *entry = pos as u16;
                                 if read_u32(base.add(candidate)) == dword {
-                                    // A literal of `i + 1 <= 16` bytes.
+                                    // A literal of `i + 1 <= 16` bytes. The 16
+                                    // probes share this code. On x86-64,
+                                    // hiding `pos` keeps LLVM from having
+                                    // every probe set a register to its `i`
+                                    // for it, which also cost a reload of
+                                    // `table` per probe: integer columns
+                                    // compressed 2-4% faster. aarch64 sets
+                                    // `i` only on the path that finds a match.
+                                    let pos = if cfg!(target_arch = "x86_64") {
+                                        opaque(pos)
+                                    } else {
+                                        pos
+                                    };
+                                    let i = pos - ip;
                                     *op = (i << 2) as u8;
                                     copy_16(base.add(next_emit), op.add(1));
-                                    ip += i;
+                                    ip = pos;
                                     op = op.add(i + 2);
                                     break 'found;
                                 }
