@@ -53,7 +53,7 @@ snappy 1.3.1 built with clang 18:
 
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
-| decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 6.6 GB/s | 3.3 GB/s | 4.3 GB/s |
+| decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 6.7 GB/s | 3.3 GB/s | 4.3 GB/s |
 | decompress, Arm Neoverse-N2 (GitHub's Arm runner) | 8.7 GB/s | 4.6 GB/s | 6.9 GB/s |
 | compress, Intel Xeon | 2.5 GB/s | 2.0 GB/s | 2.2 GB/s |
 | compress, Arm Neoverse-N2 | 3.1 GB/s | 2.6 GB/s | 2.9 GB/s |
@@ -62,7 +62,7 @@ Most of the lead comes from integer columns, run-length-like data and
 small blocks:
 
 - Integer columns decompress 1.0–2.2x as fast as C++.
-- Periodic data decompresses 3.5–19x as fast on x86 and 2.5–3.2x on Arm.
+- Periodic data decompresses 3.6–22x as fast on x86 and 2.5–3.2x on Arm.
 - 256-byte blocks decompress 2.9x as fast.
 
 Text, HTML, URLs and protobuf decompress 1.02–1.06x as fast as C++ on Arm
@@ -88,13 +88,22 @@ library's do not. On such a host, an earlier version of snipsnap measured
 1.21x as fast as C++ on the query-weighted ClickBench pages, and 5.1 GB/s
 against 3.1 GB/s on the 24 cases.
 
-Building snipsnap with profile-guided optimization or with LLVM BOLT,
-trained on the 24 cases, does not make it faster overall, on x86 or on
-Arm: decompression stays within 1% and compression is up to 3% slower.
-Individual cases do move; on Arm, BOLT compresses HTML and protobuf 11%
-faster but URLs 5% and 4 KiB blocks 7% slower. Those builds were how the
-encoder's layout problem, and a store-alignment problem in the decoding
-of long runs, were found and fixed in the source.
+Building snipsnap with profile-guided optimization, LLVM BOLT, both, or
+fat LTO, trained on the 24 cases, does not make it faster overall, on x86
+or on Arm: decompression stays within 2.5% and compression is up to 3%
+slower. Individual cases do move; on Arm, BOLT compresses HTML and
+protobuf 11% faster but URLs 5% and 4 KiB blocks 7% slower. Those builds
+were how the encoder's layout problem, and a store-alignment problem in
+the decoding of long runs, were found and fixed in the source. Huge pages
+for malloc (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`) change less than 1%.
+
+Building for the CPU does help decompression. With
+`-Ctarget-cpu=x86-64-v3`, it is 2–5% faster on AMD Zen 5, Intel Emerald
+Rapids and the Cascade Lake-class Xeon, mostly on runs, and compression
+keeps its speed. With `-Ctarget-cpu=neoverse-n2`, text decompresses 2%
+faster on Neoverse-N2. Long runs are written with AVX stores wherever the
+CPU has AVX, detected at run time, which makes them 6–17% faster on the
+Cascade Lake-class Xeon; newer cores gain nothing from that.
 
 Framed streams check every chunk's CRC-32C with the CPU's CRC instructions
 where it has them (SSE4.2 on x86, the CRC extension on Arm, detected at run
