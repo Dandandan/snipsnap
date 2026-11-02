@@ -42,14 +42,18 @@ assert_eq!(decoded, input);
 ## Performance
 
 The raw compressor implements the C++ library's default algorithm and produces
-the same bytes, so it compresses exactly as well. `examples/compare.rs`
+the same bytes as the C++ library built for the same CPU features, so it
+compresses exactly as well. Like the C++ library, it hashes with the CRC-32C
+instruction where the build enables one (SSE4.2 on x86-64, the CRC extension
+on aarch64, which Apple's arm64 targets enable by default) and with a
+multiply otherwise. `examples/compare.rs`
 compares both directions against the `snap` crate and, when built with
 `SNAPPY_CPP_PREFIX` pointing at an installed C++ snappy, against the C++
 library, on synthetic data, the standard Snappy test corpus, 4 KiB text pages
 and Parquet data pages.
 
 Geometric means over 24 cases, on one core, against `snap` 1.1.1 and C++
-snappy 1.3.1 built with clang 18:
+snappy 1.3.1 built with clang 18 (Apple's clang on macOS):
 
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
@@ -57,10 +61,12 @@ snappy 1.3.1 built with clang 18:
 | decompress, AMD EPYC 7763 (Zen 3, GitHub's x86 runner) | 4.9 GB/s | 2.7 GB/s | 3.2 GB/s |
 | decompress, AMD EPYC 9V45 (Zen 5, GitHub's x86 runner) | 12.7 GB/s | 5.6 GB/s | 7.0 GB/s |
 | decompress, Arm Neoverse-N2 (GitHub's Arm runner) | 8.9 GB/s | 4.7 GB/s | 6.9 GB/s |
+| decompress, Apple M1 (GitHub's macOS runner, not pinned) | 8.6 GB/s | 4.2 GB/s | 6.5 GB/s |
 | compress, Intel Xeon | 2.4 GB/s | 2.1 GB/s | 2.2 GB/s |
 | compress, AMD EPYC 7763 | 2.3 GB/s | 2.1 GB/s | 2.3 GB/s |
 | compress, AMD EPYC 9V45 | 4.5 GB/s | 3.7 GB/s | 4.2 GB/s |
 | compress, Arm Neoverse-N2 | 3.1 GB/s | 2.6 GB/s | 2.9 GB/s |
+| compress, Apple M1 | 3.2 GB/s | 2.5 GB/s | 2.9 GB/s |
 
 Most of the lead comes from integer columns, run-length-like data and
 small blocks:
@@ -69,8 +75,8 @@ small blocks:
 - Periodic data decompresses 3.6–39x as fast on x86 and 2.5–3.2x on Arm.
 - 256-byte blocks decompress 2.2–3.0x as fast.
 
-Text, HTML, URLs and protobuf decompress 1.07–1.11x as fast as C++ on Arm
-and 0.98–1.03x on Zen 5, and at 0.89–1.00x its speed on Zen 3 and
+Text, HTML, URLs and protobuf decompress 1.07–1.11x as fast as C++ on
+Neoverse-N2, 1.03–1.10x on Apple M1 and 0.98–1.03x on Zen 5, and at 0.89–1.00x its speed on Zen 3 and
 0.96–0.99x on the Cascade Lake-class Xeon; 1.0–2.4x as fast as `snap`.
 On x86 the fast loop copies 64 bytes for every element instead of
 branching on its length. Copying 32 bytes and branching for longer
@@ -115,8 +121,24 @@ Zen 5. With the AVX code chosen at run time, a build for
 `-Ctarget-cpu=x86-64-v3` decompresses at the same speed on Zen 3 and Zen
 5; it compresses long matches 12–17% slower on the Cascade Lake-class
 Xeon, whose `vptest` does not fuse with its branch, and 14–16% faster on
-Zen 3. On Arm, `-Ctarget-cpu=neoverse-n2` decompresses text 2% faster on
-Neoverse-N2.
+Zen 3.
+
+On Arm, building for a particular core changes little on Neoverse-N2. For
+`neoverse-n1`, `neoverse-n2`, `neoverse-v1`, `neoverse-v2`, `cortex-x2` or
+`native`, decompression stays within 0.4% of the default build, except
+that 256-byte blocks decompress 5% faster. `ampere1` decompresses 2%
+slower, and `cortex-a72` and `cortex-a76` compress 2% slower. No target
+makes LLVM use SVE here. On Apple M1 the default target is the fastest;
+`generic` and `neoverse-n1` builds decompress 3% slower.
+
+Hashing with the CRC-32C instruction, where the build enables it,
+compressed 5–6% faster on Apple M1 and 0.5% faster on Neoverse-N2 (with
+`-Ctarget-feature=+crc`). On Zen 4 with `-Ctarget-cpu=x86-64-v2`, it
+compressed text, HTML, protobuf and integers 2–6% faster, but runs 18%
+slower than the multiply in the same build: the long-match loop is the
+same code, placed differently. Copying 64 bytes per element with AVX-512
+instead of AVX made decompression 1–9% slower on Zen 4 and on Intel Ice
+Lake and Cascade Lake Xeons, and BMI2 builds changed it by less than 1%.
 
 Framed streams check every chunk's CRC-32C with the CPU's CRC instructions
 where it has them (SSE4.2 on x86, the CRC extension on Arm, detected at run
