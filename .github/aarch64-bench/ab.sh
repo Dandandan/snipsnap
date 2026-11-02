@@ -11,14 +11,19 @@
 #   VARIANTS  glob of the variants/ directories to include (default all);
 #             each holds files that replace the same paths under src/ at HEAD
 #
+# Runs on Linux and macOS (no pinning there). A build that cannot run on the
+# host, such as one for a CPU with instructions the host lacks, is reported
+# and skipped.
+#
 # Every side is extracted to the same directory and its files touched before
 # it is built, so that cargo cannot mistake one side's build for another's.
 set -euo pipefail
-SNAPPY=$(realpath "$1"); HITS=$(realpath "$2"); W=$(realpath -m "$3")
+mkdir -p "$3"; SNAPPY=$(realpath "$1"); HITS=$(realpath "$2"); W=$(realpath "$3")
 REPO=$(git rev-parse --show-toplevel)
 CPU=${CPU:-1}; ROUNDS=${ROUNDS:-3}
-export LD_LIBRARY_PATH="$SNAPPY/lib" SNIPSNAP_PARQUET_BENCH=$HITS SNAPPY_CPP_PREFIX=$SNAPPY
-mkdir -p "$W"
+export LD_LIBRARY_PATH="$SNAPPY/lib" DYLD_LIBRARY_PATH="$SNAPPY/lib"
+export SNIPSNAP_PARQUET_BENCH=$HITS SNAPPY_CPP_PREFIX=$SNAPPY
+PIN=""; if command -v taskset > /dev/null; then PIN="taskset -c $CPU"; fi
 IFS=';' read -ra targets <<< "${TARGETS:-plain:}"
 SIDES=""
 build_side() { # build_side NAME COMMIT [VARIANT_DIR]
@@ -32,7 +37,7 @@ build_side() { # build_side NAME COMMIT [VARIANT_DIR]
       --target-dir "$W/t-${t%%:*}")
     cp "$W/t-${t%%:*}/release/examples/compare" "$W/compare-$1-${t%%:*}"
     echo "== built $1-${t%%:*} ($2${3:+ + $(basename "$3")}, RUSTFLAGS=${t#*:})" \
-      "$(md5sum < "$W/compare-$1-${t%%:*}" | cut -c1-12)"
+      "$(cksum < "$W/compare-$1-${t%%:*}" | cut -d' ' -f1)"
   done
   SIDES="$SIDES $1"
 }
@@ -47,7 +52,7 @@ for round in $(seq "$ROUNDS"); do
       b="$side-${t%%:*}"
       for op in ${OPS:-decode encode}; do
         echo "-- $b $op (round $round)"
-        taskset -c "$CPU" "$W/compare-$b" --$op --samples 8 | tail -26
+        $PIN "$W/compare-$b" --$op --samples 8 | tail -26 || echo "!! $b $op failed"
       done
     done
   done
