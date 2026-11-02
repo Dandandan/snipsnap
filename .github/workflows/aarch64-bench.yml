@@ -12,9 +12,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: macos-15, n: 1}
-          - {os: macos-15, n: 2}
-          - {os: ubuntu-24.04-arm, n: 1}
+          - {os: ubuntu-24.04-arm, n: 1, targets: "plain:;neoverse-n2:-Ctarget-cpu=neoverse-n2;align:-Cllvm-args=-align-all-functions=4 -Cllvm-args=-align-loops=32"}
+          - {os: ubuntu-24.04-arm, n: 2, targets: "plain:;neoverse-n2:-Ctarget-cpu=neoverse-n2;align:-Cllvm-args=-align-all-functions=4 -Cllvm-args=-align-loops=32"}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -40,5 +39,5 @@ jobs:
       - name: Benchmark
         run: |
           (lscpu | grep -E "Model name|Vendor") 2>/dev/null || sysctl -n machdep.cpu.brand_string || true
-          OPS=encode ROUNDS=4 \
+          TARGETS="${{ matrix.targets }}" VARIANTS=none ROUNDS=3 \
             bash .github/aarch64-bench/ab.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/ab" 2>&1
