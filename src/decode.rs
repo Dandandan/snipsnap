@@ -218,6 +218,7 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     let (ip_limit_2, op_limit_2) = limits(2, true);
     let (ip_limit_1, op_limit_1) = limits(1, true);
     let (ip_limit_n, op_limit_n) = limits(1, false);
+    let avx = has_avx();
     let mut ip = 0usize;
     let mut op = 0usize;
     while ip < src_len {
@@ -225,7 +226,7 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
         // respective loop after the starting positions.
         let (ip_limit, op_limit) = if ip < ip_limit_2 && op < op_limit_2 {
             (ip, op) = unsafe {
-                decode_fast::<2, true>(src_ptr, ip, ip_limit_2, dst_ptr, op, op_limit_2)
+                decode_fast_main(avx, src_ptr, ip, ip_limit_2, dst_ptr, op, op_limit_2)
             };
             (ip_limit_2, op_limit_2)
         } else if ip < ip_limit_1 && op < op_limit_1 {
@@ -279,6 +280,83 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
 /// bytes; `dst[..op]` must be initialized.
 #[inline(never)]
 unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
+    src: *const u8,
+    ip: usize,
+    ip_limit: usize,
+    dst: *mut u8,
+    op: usize,
+    op_limit: usize,
+) -> (usize, usize) {
+    // SAFETY: as documented above.
+    unsafe { decode_tags::<UNROLL, WIDE>(src, ip, ip_limit, dst, op, op_limit) }
+}
+
+/// Whether the main fast loop may use [`decode_fast_avx`].
+#[inline(always)]
+fn has_avx() -> bool {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    return std::is_x86_feature_detected!("avx");
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    false
+}
+
+/// The main fast loop, `decode_fast::<2, true>`, or its copy compiled with
+/// AVX if `avx` (from [`has_avx`]) is set.
+///
+/// # Safety
+///
+/// As for [`decode_fast`].
+#[inline(always)]
+unsafe fn decode_fast_main(
+    avx: bool,
+    src: *const u8,
+    ip: usize,
+    ip_limit: usize,
+    dst: *mut u8,
+    op: usize,
+    op_limit: usize,
+) -> (usize, usize) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if avx {
+        // SAFETY: as documented above, and `has_avx` checked for AVX.
+        return unsafe { decode_fast_avx(src, ip, ip_limit, dst, op, op_limit) };
+    }
+    let _ = avx;
+    // SAFETY: as documented above.
+    unsafe { decode_fast::<2, true>(src, ip, ip_limit, dst, op, op_limit) }
+}
+
+/// `decode_fast::<2, true>` compiled with AVX. Each element's 64-byte copy
+/// then takes two 32-byte loads and stores instead of four of 16 bytes,
+/// which made text and URLs decode 30% faster on AMD Zen 3 (EPYC 7763),
+/// where the 16-byte stores held the loop back, and ClickBench's pages 28%
+/// faster. A Cascade Lake-class Xeon measured 0.4% slower.
+///
+/// # Safety
+///
+/// As for [`decode_fast`], and the CPU supports AVX.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[target_feature(enable = "avx")]
+#[inline(never)]
+unsafe fn decode_fast_avx(
+    src: *const u8,
+    ip: usize,
+    ip_limit: usize,
+    dst: *mut u8,
+    op: usize,
+    op_limit: usize,
+) -> (usize, usize) {
+    // SAFETY: as documented above.
+    unsafe { decode_tags::<2, true>(src, ip, ip_limit, dst, op, op_limit) }
+}
+
+/// The body of [`decode_fast`] and [`decode_fast_avx`].
+///
+/// # Safety
+///
+/// As for [`decode_fast`].
+#[inline(always)]
+unsafe fn decode_tags<const UNROLL: usize, const WIDE: bool>(
     src: *const u8,
     ip: usize,
     ip_limit: usize,
