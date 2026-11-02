@@ -1,0 +1,35 @@
+name: aarch64 benchmark
+
+on:
+  push:
+    branches: [ccr-e4c01f21-x6mf9a]
+    paths: ["src/**", "examples/**", ".github/aarch64-bench/**", ".github/workflows/aarch64-bench.yml"]
+  workflow_dispatch:
+
+jobs:
+  perf:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build C++ snappy with clang, install perf
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang cmake linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y -q linux-tools-azure || true
+          echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+          echo 0 | sudo tee /proc/sys/kernel/kptr_restrict
+          git clone -q https://github.com/google/snappy.git "$RUNNER_TEMP/snappy-src"
+          git -C "$RUNNER_TEMP/snappy-src" checkout -q 9466064
+          cmake -S "$RUNNER_TEMP/snappy-src" -B "$RUNNER_TEMP/snappy-build" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBUILD_SHARED_LIBS=ON \
+            -DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/snappy"
+          cmake --build "$RUNNER_TEMP/snappy-build" -j4 && cmake --install "$RUNNER_TEMP/snappy-build"
+      - name: Counters
+        run: |
+          lscpu | grep -E "Model name|Vendor" || true; rustc --version; uname -r
+          .github/aarch64-bench/perf.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/perf" 2>&1
