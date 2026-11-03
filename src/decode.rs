@@ -25,6 +25,7 @@ use crate::bytes::{
     copy_16_to_64, copy_exact, copy_short, read_32, read_u16, read_u32, read_u64,
     write_16, write_32, write_u16, write_u32, write_u64,
 };
+use crate::layout::{self, align_function_64};
 use crate::select::{opaque, select_if_zero, select_ptr_if_zero};
 use crate::{Error, Result, decode_error};
 
@@ -203,6 +204,7 @@ fn single_literal(src: &[u8], dst_len: usize) -> Option<&[u8]> {
 /// smaller margins than the one before, so fewer tags are left to the
 /// careful path, which matters for small blocks.
 #[inline(never)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(clippy::unit_arg))]
 fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     let src_len = src.len();
     let dst_len = dst.len();
@@ -217,24 +219,47 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
     let (ip_limit_2, op_limit_2) = limits(2, true);
     let (ip_limit_1, op_limit_1) = limits(1, true);
     let (ip_limit_n, op_limit_n) = limits(1, false);
+    let avx = has_avx();
+    // The main loop starts with 32-byte copies and a branch for longer
+    // elements, and may continue with 64-byte copies (see `LONG_SPACING`).
+    let mut copy64 = false;
     let mut ip = 0usize;
     let mut op = 0usize;
     while ip < src_len {
         // SAFETY: (for all three calls) the limits leave the margins of the
         // respective loop after the starting positions.
         let (ip_limit, op_limit) = if ip < ip_limit_2 && op < op_limit_2 {
-            (ip, op) = unsafe {
-                decode_fast::<2, true>(src_ptr, ip, ip_limit_2, dst_ptr, op, op_limit_2)
+            let gave_up;
+            (ip, op, gave_up) = unsafe {
+                decode_fast_main(
+                    avx,
+                    copy64,
+                    adapts_copy_width(),
+                    src_ptr,
+                    ip,
+                    ip_limit_2,
+                    dst_ptr,
+                    op,
+                    op_limit_2,
+                )
             };
+            if is_set(gave_up) {
+                copy64 = true;
+                continue;
+            }
             (ip_limit_2, op_limit_2)
         } else if ip < ip_limit_1 && op < op_limit_1 {
-            (ip, op) = unsafe {
-                decode_fast::<1, true>(src_ptr, ip, ip_limit_1, dst_ptr, op, op_limit_1)
+            (ip, op, _) = unsafe {
+                decode_fast::<1, true, true>(
+                    UNSET, src_ptr, ip, ip_limit_1, dst_ptr, op, op_limit_1,
+                )
             };
             (ip_limit_1, op_limit_1)
         } else if ip < ip_limit_n && op < op_limit_n {
-            (ip, op) = unsafe {
-                decode_fast::<1, false>(src_ptr, ip, ip_limit_n, dst_ptr, op, op_limit_n)
+            (ip, op, _) = unsafe {
+                decode_fast::<1, false, true>(
+                    UNSET, src_ptr, ip, ip_limit_n, dst_ptr, op, op_limit_n,
+                )
             };
             (ip_limit_n, op_limit_n)
         } else {
@@ -266,10 +291,12 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
 /// Decodes tags, `UNROLL` (1 or 2) per limit check, until `ip >= ip_limit`,
 /// `op >= op_limit` or a tag that needs the careful path. Returns the
 /// position of the first undecoded tag, the corresponding output position,
-/// and why it stopped.
+/// and whether it stopped to leave the rest to 64-byte copies (with
+/// `adaptive`, see `LONG_SPACING`).
 ///
 /// Unless `WIDE` is set, only elements of up to `FAST_COPY` bytes that do
 /// not overlap their own output are decoded, which keeps the margins small.
+/// `COPY64` makes the wide loops copy 64 bytes of every element on x86-64.
 ///
 /// # Safety
 ///
@@ -277,20 +304,128 @@ fn decode_in_place(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> Result<()> {
 /// bytes and `dst` for writes of `op_limit + output_margin(UNROLL, WIDE)`
 /// bytes; `dst[..op]` must be initialized.
 #[inline(never)]
-unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
+unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool, const COPY64: bool>(
+    adaptive: Flag,
     src: *const u8,
     ip: usize,
     ip_limit: usize,
     dst: *mut u8,
     op: usize,
     op_limit: usize,
-) -> (usize, usize) {
+) -> (usize, usize, Flag) {
+    // SAFETY: as documented above.
+    unsafe {
+        decode_tags::<UNROLL, WIDE, COPY64>(
+            adaptive, src, ip, ip_limit, dst, op, op_limit,
+        )
+    }
+}
+
+/// Whether the main fast loop may use [`decode_fast_avx`].
+#[inline(always)]
+fn has_avx() -> bool {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    return std::is_x86_feature_detected!("avx");
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    false
+}
+
+/// The main fast loop, `decode_fast::<2, true, COPY64>`, or its copy
+/// compiled with AVX if `avx` (from [`has_avx`]) is set. With `copy64` (on
+/// x86-64) it copies 64 bytes of every element; otherwise 32 bytes, with a
+/// branch for longer elements, giving up on that branch when `adaptive`
+/// (see `LONG_SPACING`), which the returned flag tells.
+///
+/// # Safety
+///
+/// As for [`decode_fast`].
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn decode_fast_main(
+    avx: bool,
+    copy64: bool,
+    adaptive: Flag,
+    src: *const u8,
+    ip: usize,
+    ip_limit: usize,
+    dst: *mut u8,
+    op: usize,
+    op_limit: usize,
+) -> (usize, usize, Flag) {
+    let copy64 = cfg!(target_arch = "x86_64") && copy64;
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if avx {
+        // SAFETY: as documented above, and `has_avx` checked for AVX.
+        return unsafe {
+            if copy64 {
+                decode_fast_avx::<true>(adaptive, src, ip, ip_limit, dst, op, op_limit)
+            } else {
+                decode_fast_avx::<false>(adaptive, src, ip, ip_limit, dst, op, op_limit)
+            }
+        };
+    }
+    let _ = avx;
+    // SAFETY: as documented above.
+    unsafe {
+        if copy64 {
+            decode_fast::<2, true, true>(adaptive, src, ip, ip_limit, dst, op, op_limit)
+        } else {
+            decode_fast::<2, true, false>(adaptive, src, ip, ip_limit, dst, op, op_limit)
+        }
+    }
+}
+
+/// `decode_fast::<2, true, COPY64>` compiled with AVX. Each element's copy
+/// then takes 32-byte loads and stores instead of twice as many of 16
+/// bytes. With the 64-byte copies, that made text and URLs decode 30%
+/// faster on AMD Zen 3 (EPYC 7763), where the 16-byte stores held the loop
+/// back, and ClickBench's pages 28% faster; a Cascade Lake-class Xeon
+/// measured 0.4% slower.
+///
+/// # Safety
+///
+/// As for [`decode_fast`], and the CPU supports AVX.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[target_feature(enable = "avx")]
+#[inline(never)]
+unsafe fn decode_fast_avx<const COPY64: bool>(
+    adaptive: Flag,
+    src: *const u8,
+    ip: usize,
+    ip_limit: usize,
+    dst: *mut u8,
+    op: usize,
+    op_limit: usize,
+) -> (usize, usize, Flag) {
+    // SAFETY: as documented above.
+    unsafe {
+        decode_tags::<2, true, COPY64>(adaptive, src, ip, ip_limit, dst, op, op_limit)
+    }
+}
+
+/// The body of [`decode_fast`] and [`decode_fast_avx`].
+///
+/// # Safety
+///
+/// As for [`decode_fast`].
+#[inline(always)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+unsafe fn decode_tags<const UNROLL: usize, const WIDE: bool, const COPY64: bool>(
+    adaptive: Flag,
+    src: *const u8,
+    ip: usize,
+    ip_limit: usize,
+    dst: *mut u8,
+    op: usize,
+    op_limit: usize,
+) -> (usize, usize, Flag) {
     const { assert!(UNROLL == 1 || (UNROLL == 2 && WIDE)) };
     debug_assert!(ip < ip_limit && op < op_limit);
     // SAFETY: `ip < ip_limit` and `op < op_limit`, so all four are in bounds.
     // From here on `ip` points just past the tag being decoded. The output
     // position is kept as a pointer so that stores use simple addressing.
-    let (mut ip, ip_limit, mut out, out_limit) = unsafe {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let (mut ip, ip_limit, mut out, mut out_limit) = unsafe {
         (
             src.add(ip + 1),
             src.add(ip_limit + 1),
@@ -320,6 +455,12 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
     // pending.
     let mut pending_from = NO_COPY.as_ptr();
     let mut pending_len = 0usize;
+    // Elements of more than `FAST_COPY` bytes seen, and where the output
+    // started, for giving up on the branch for them (see `LONG_SPACING`).
+    #[cfg(target_arch = "x86_64")]
+    let mut long_copies = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    let out_start = out;
 
     // One element. `break $exit` leaves the loop with `ip` just past the tag
     // of the first element not decoded and the pending copy not yet done.
@@ -330,7 +471,7 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             // `TAG_READ_SLOP` of the tag, and in the narrow loop within
             // `FAST_COPY + 2`: longer literals are left to the careful path,
             // so their next tag is not needed.
-            let (tag_type, next_tag) = unsafe { next_tag::<WIDE>(ip, tag) };
+            let (tag_type, next_tag, advance) = unsafe { next_tag::<WIDE>(ip, tag) };
 
             // SAFETY: `tag` is a byte (`next_tag` hides that from LLVM), and
             // the reads are within `TAG_READ_SLOP` of the tag. The advance is
@@ -338,7 +479,6 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
             // narrow loop's margin does not cover the advance of a literal it
             // leaves to the careful path, hence the wrapping add.
             let (entry, trailer, next_ip) = unsafe {
-                let advance = usize::from(*tables.advance.get_unchecked(tag));
                 (
                     isize::from(*len_minus_offset.get_unchecked(tag)),
                     if cfg!(target_arch = "x86_64") {
@@ -428,12 +568,12 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                 // SAFETY: the pending copy is within the margins (see
                 // `copy_pending`), and so are 64 bytes from either end of it.
                 unsafe {
-                    if WIDE && cfg!(target_arch = "x86_64") {
-                        // On x86-64 the branch on the copy's length cost more
-                        // than copying 64 bytes every time: in ClickBench's
-                        // URLs and titles, copies of up to 32 bytes and of 64
-                        // bytes alternate unpredictably. On aarch64 the extra
-                        // stores cost more than the mispredictions.
+                    if WIDE && cfg!(target_arch = "x86_64") && COPY64 {
+                        // Where elements of more than 32 bytes are common, as
+                        // in ClickBench's URLs and titles, the branch below
+                        // mispredicts more than copying 64 bytes every time
+                        // costs on x86-64 (see `LONG_SPACING`). On aarch64 the
+                        // extra stores cost more than the mispredictions.
                         ptr::copy(pending_from, out, 64);
                     } else {
                         ptr::copy(pending_from, out, FAST_COPY);
@@ -445,6 +585,15 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
                                 out.add(FAST_COPY),
                                 64 - FAST_COPY,
                             );
+                            #[cfg(target_arch = "x86_64")]
+                            if adaptive {
+                                long_copies += 1;
+                                let written = out.offset_from(out_start) as usize;
+                                if long_copies * LONG_SPACING > written + LONG_GRACE {
+                                    // Leave at the next limit check.
+                                    out_limit = dst;
+                                }
+                            }
                         }
                     }
                 }
@@ -487,28 +636,98 @@ unsafe fn decode_fast<const UNROLL: usize, const WIDE: bool>(
         (
             ip.offset_from(src) as usize - 1,
             out.offset_from(dst) as usize,
+            gave_up(out_limit, dst),
         )
     }
 }
 
-/// Returns the type of `tag` (at `ip - 1`) and the tag that follows its
-/// element: at `ip + (tag >> 2) + 1` for a literal, at `ip + tag_type` for a
-/// copy.
+/// On x86-64 the main loop copies 32 bytes of each element and branches for
+/// longer ones. Once those average more than one per `LONG_SPACING` output
+/// bytes, past the first eight, it leaves the rest of the block to a copy of
+/// itself that copies 64 bytes of every element instead.
+///
+/// The branch mispredicts on long elements, and the 64-byte copies cost
+/// stores on every element. Text has almost no elements longer than 32 bytes
+/// and decodes 3.5-8% faster with the branch (21% on Zen 3); ClickBench's
+/// pages, with long and short elements interleaved every 100 bytes or so,
+/// decoded 6-20% slower with only the branch, and switch within their first
+/// few KiB.
+#[cfg(target_arch = "x86_64")]
+const LONG_SPACING: usize = 128;
+#[cfg(target_arch = "x86_64")]
+const LONG_GRACE: usize = 8 * LONG_SPACING;
+
+/// Whether the main loop switches to 64-byte copies when long elements are
+/// common (see `LONG_SPACING`): everywhere but on AMD Zen 3, which decoded
+/// ClickBench's pages 8-9% faster with the branch too.
+#[inline(always)]
+fn adapts_copy_width() -> Flag {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    return !crate::cpu::amd_zen3();
+    #[cfg(all(target_arch = "x86_64", miri))]
+    return true;
+    #[cfg(not(target_arch = "x86_64"))]
+    UNSET
+}
+
+/// The main loop's [`adapts_copy_width`] setting, and its report of having
+/// given up on the branch: a `bool` on x86-64, and zero-sized elsewhere, so
+/// that the loops there compile to the same code as without it.
+#[cfg(target_arch = "x86_64")]
+type Flag = bool;
+#[cfg(not(target_arch = "x86_64"))]
+type Flag = ();
+
+#[cfg(target_arch = "x86_64")]
+const UNSET: Flag = false;
+#[cfg(not(target_arch = "x86_64"))]
+const UNSET: Flag = ();
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn is_set(flag: Flag) -> bool {
+    flag
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn is_set(_: Flag) -> bool {
+    false
+}
+
+/// Whether the main loop gave up on the branch, which it marks by moving its
+/// output limit to the start of the output.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn gave_up(out_limit: *mut u8, dst: *mut u8) -> Flag {
+    out_limit == dst
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn gave_up(_: *mut u8, _: *mut u8) -> Flag {}
+
+/// Returns the type of `tag` (at `ip - 1`), the tag that follows its
+/// element (at `ip + (tag >> 2) + 1` for a literal, at `ip + tag_type` for a
+/// copy) and the element's encoded size, which takes `ip` past that tag. The
+/// size is only meaningful for tags the fast loop decodes.
 ///
 /// Both candidates are loaded before selecting, which keeps the select off
-/// the load-to-load dependency chain. On x86-64 and aarch64 the select uses
+/// the load-to-load dependency chain. On x86-64 and aarch64 the selects use
 /// the flags of `tag & 3`, as in the C++ library, which saves a compare per
-/// tag.
+/// tag, and the size is computed rather than loaded from
+/// [`Tables::advance`]: one load less per tag, and a shorter chain to the
+/// next `ip`.
 ///
 /// # Safety
 ///
 /// Both candidates must be readable. Unless `WIDE`, the literal candidate is
 /// capped at `ip + FAST_COPY + 1`.
 #[inline(always)]
-unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize) {
+unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize, usize) {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     if WIDE {
-        let (tag_type, next_tag);
+        let (tag_type, next_tag, advance);
         // SAFETY: the caller guarantees both loads are in bounds.
         unsafe {
             std::arch::asm!(
@@ -516,21 +735,26 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
                 "shr {l:e}, 2",
                 "and {t:e}, 3",
                 "movzx {n:e}, byte ptr [{ip} + {t}]",
+                "lea {a:e}, [{t} + 1]",
+                "lea {b:e}, [{l} + 2]",
                 "movzx {l:e}, byte ptr [{ip} + {l} + 1]",
                 "cmovz {n:e}, {l:e}",
+                "cmovz {a:e}, {b:e}",
                 tag = in(reg) tag,
                 ip = in(reg) ip,
                 t = out(reg) tag_type,
                 n = out(reg) next_tag,
+                a = out(reg) advance,
+                b = out(reg) _,
                 l = inout(reg) tag => _,
                 options(pure, readonly, nostack),
             );
         }
-        return (tag_type, next_tag);
+        return (tag_type, next_tag, advance);
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if WIDE {
-        let (tag_type, next_tag);
+        let (tag_type, next_tag, advance);
         // The literal candidate is loaded from `ip + 1` at offset `tag >> 2`
         // rather than from `ip + (tag >> 2)` at offset 1: an add with a
         // right-shifted operand takes two cycles on Neoverse cores, while
@@ -544,18 +768,21 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
                 "ands {t}, {tag}, #3",
                 "lsr {l}, {tag}, #2",
                 "ldrb {n:w}, [{ip}, {t}]",
+                "add {a}, {l}, #2",
                 "ldrb {l:w}, [{p}, {l}]",
                 "csel {n}, {l}, {n}, eq",
+                "csinc {a}, {a}, {t}, eq",
                 tag = in(reg) tag,
                 ip = in(reg) ip,
                 t = out(reg) tag_type,
                 n = out(reg) next_tag,
+                a = out(reg) advance,
                 l = out(reg) _,
                 p = out(reg) _,
                 options(pure, readonly, nostack),
             );
         }
-        return (tag_type, next_tag);
+        return (tag_type, next_tag, advance);
     }
     let tag_type = tag & 3;
     let literal_len = if WIDE {
@@ -568,25 +795,13 @@ unsafe fn next_tag<const WIDE: bool>(ip: *const u8, tag: usize) -> (usize, usize
     // SAFETY: as documented above.
     let next_literal = usize::from(unsafe { ptr::read_volatile(ip.add(literal_len)) });
     let next_copy = usize::from(unsafe { ptr::read_volatile(ip.add(tag_type)) });
-    (tag_type, select_if_zero(tag_type, next_literal, next_copy))
-}
-
-/// Aligns the start of the calling function to 64 bytes (on x86-64), so that
-/// the layout of its loops does not depend on where the linker places it.
-///
-/// That layout matters on cores with Intel's JCC erratum (Skylake to Cascade
-/// Lake and their client parts): a 32-byte block of code holding a jump that
-/// crosses or ends on its boundary is not cached as decoded micro-ops, which
-/// slowed the fast loop by 10-20% in unlucky placements. The directive raises
-/// the alignment of the function's section; it also pads to 64 bytes where it
-/// stands, so it belongs on a path that is taken once per call at most.
-#[inline(always)]
-fn align_function_64() {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    // SAFETY: an assembler directive; the padding is executed as nops.
-    unsafe {
-        std::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
-    }
+    // SAFETY: `tag` is a byte.
+    let advance = usize::from(unsafe { *TABLES.advance.get_unchecked(tag) });
+    (
+        tag_type,
+        select_if_zero(tag_type, next_literal, next_copy),
+        advance,
+    )
 }
 
 /// In the main fast loop (`UNROLL == 2`), aligns the next instruction to 32
@@ -594,12 +809,8 @@ fn align_function_64() {
 /// [`align_function_64`]).
 #[inline(always)]
 fn align_32<const UNROLL: usize>() {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
     if UNROLL == 2 {
-        // SAFETY: an assembler directive; the padding is executed as nops.
-        unsafe {
-            std::arch::asm!(".p2align 5", options(nomem, nostack, preserves_flags));
-        }
+        layout::align_32();
     }
 }
 
@@ -756,11 +967,91 @@ unsafe fn fill_periodic(start: *mut u8, offset: usize, total: usize) {
             copy_overlapping(start, start, offset, block);
         }
         let mut pos = block;
-        while pos < total {
+        // On aarch64 (Neoverse-N2) the unaligned stores cost little, and
+        // advancing the phase of the aligned blocks cost periods of three
+        // bytes 6%, so there only periods that divide 64 take the aligned
+        // path, which needs no phase.
+        if total < 256 || (cfg!(target_arch = "aarch64") && 64 % offset != 0) {
+            while pos < total {
+                copy_16_to_64(start, start.add(pos), block);
+                pos += block;
+            }
+            return;
+        }
+        // Long runs are written in 64-byte-aligned blocks, each copied from
+        // the offset in the pattern where it starts. Copying the block to
+        // `start + block`, `start + 2 * block` and so on instead split one
+        // 16-byte store in four across cache lines unless `start` was
+        // 16-byte aligned and the block 64 bytes, and even then it ran at
+        // half speed in some allocations: runs of one, three or eight bytes
+        // and 16-byte periods decoded half as fast.
+        //
+        // The pattern is first extended far enough that every source block
+        // lies before the first aligned block, which may start up to 63
+        // bytes before `pos` and rewrites those bytes with their own values.
+        // The offset of each source block in the pattern, `phase`, advances
+        // by `64 % offset` from one block to the next.
+        while pos < offset + 127 {
             copy_16_to_64(start, start.add(pos), block);
             pos += block;
         }
+        let end = start.add(total);
+        let mut dst = start.add(pos);
+        dst = dst.sub(dst.addr() % 64);
+        // Where AVX is available, each block is one pair of 32-byte stores
+        // instead of four 16-byte ones: runs of one to eight bytes decoded
+        // 8-16% faster on a Cascade Lake-class Xeon.
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        if std::is_x86_feature_detected!("avx") {
+            return fill_aligned_avx(start, offset, dst, end);
+        }
+        fill_aligned(start, offset, dst, end);
     }
+}
+
+/// Writes the 64-byte blocks from `dst` until `end` or past it, each copied
+/// from the offset in the pattern of `offset` bytes at `start` where it
+/// starts.
+///
+/// # Safety
+///
+/// `dst` is 64-byte aligned and at least `offset + 63` bytes after `start`,
+/// `start[..offset + 63]` holds the pattern, and the blocks are valid for
+/// writes.
+#[inline(always)]
+unsafe fn fill_aligned(start: *mut u8, offset: usize, mut dst: *mut u8, end: *mut u8) {
+    unsafe {
+        let mut phase = dst.offset_from(start) as usize % offset;
+        let step = 64 % offset;
+        if step == 0 {
+            let source = start.add(phase);
+            while dst < end {
+                copy_16_to_64(source, dst, 64);
+                dst = dst.add(64);
+            }
+            return;
+        }
+        while dst < end {
+            copy_16_to_64(start.add(phase), dst, 64);
+            dst = dst.add(64);
+            phase += step;
+            if phase >= offset {
+                phase -= offset;
+            }
+        }
+    }
+}
+
+/// [`fill_aligned`] compiled with AVX.
+///
+/// # Safety
+///
+/// As for [`fill_aligned`], and the CPU supports AVX.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[target_feature(enable = "avx")]
+unsafe fn fill_aligned_avx(start: *mut u8, offset: usize, dst: *mut u8, end: *mut u8) {
+    // SAFETY: as documented above.
+    unsafe { fill_aligned(start, offset, dst, end) }
 }
 
 /// Decodes the single tag at `src[ip]` with full bounds checks.

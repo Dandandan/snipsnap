@@ -114,15 +114,69 @@ pub(crate) unsafe fn copy_short(from: *const u8, to: *mut u8, len: usize) {
 }
 
 /// Copies exactly `len` bytes between non-overlapping ranges: up to 64
-/// inline, more with `memcpy`. Short copies are common at the ends of small
-/// blocks, where a call would cost more than the copy.
+/// inline, more with [`copy_long`]. Short copies are common at the ends of
+/// small blocks, where a call would cost more than the copy.
 #[inline(always)]
 pub(crate) unsafe fn copy_exact(from: *const u8, to: *mut u8, len: usize) {
     unsafe {
         if len <= 64 {
             copy_short(from, to, len);
         } else {
-            ptr::copy_nonoverlapping(from, to, len);
+            copy_long(from, to, len);
+        }
+    }
+}
+
+/// Copies `len` bytes between non-overlapping ranges with `memcpy`.
+///
+/// glibc copies 2112 bytes and more with `rep movsb` on CPUs with fast
+/// short `rep movsb`. On AMD Zen 3 and Zen 4 that runs at 3-5 GB/s instead of
+/// 25-50 for some distances between the buffers, which made 64 KiB literals
+/// decode 18x and encode 12x slower on Zen 3. There the copy is made in
+/// pieces below that size, which glibc copies with vector loads and stores.
+///
+/// On x86-64 this stays out of line, so that the loops calling it keep the
+/// code they had with a call to `memcpy`: inlined, the check slowed HTML and
+/// protobuf compression by 3-7% on Ice Lake and Emerald Rapids Xeons, which
+/// never take it, and by up to 27% on a Cascade Lake-class Xeon.
+#[cfg_attr(target_arch = "x86_64", inline(never))]
+#[cfg_attr(not(target_arch = "x86_64"), inline(always))]
+pub(crate) unsafe fn copy_long(from: *const u8, to: *mut u8, len: usize) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if len > LONG_COPY_PIECE && crate::cpu::amd_family_19h() {
+        return unsafe { copy_in_pieces(from, to, len) };
+    }
+    unsafe { ptr::copy_nonoverlapping(from, to, len) }
+}
+
+/// Below glibc's `rep movsb` threshold on Zen 3 and Zen 4, 2112 bytes.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+const LONG_COPY_PIECE: usize = 2048;
+
+/// [`copy_long`] in pieces of `LONG_COPY_PIECE` bytes.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[inline(never)]
+unsafe fn copy_in_pieces(from: *const u8, to: *mut u8, len: usize) {
+    let mut done = 0;
+    // SAFETY: the pieces cover `0..len` of both ranges.
+    unsafe {
+        while len - done > LONG_COPY_PIECE {
+            ptr::copy_nonoverlapping(from.add(done), to.add(done), LONG_COPY_PIECE);
+            done += LONG_COPY_PIECE;
+        }
+        ptr::copy_nonoverlapping(from.add(done), to.add(done), len - done);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", not(miri)))]
+mod tests {
+    #[test]
+    fn copy_in_pieces_copies_every_byte() {
+        let src: Vec<u8> = (0..70_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        for len in [0, 1, 2047, 2048, 2049, 4096, 4097, 65_536, 70_000] {
+            let mut dst = vec![0; len];
+            unsafe { super::copy_in_pieces(src.as_ptr(), dst.as_mut_ptr(), len) };
+            assert_eq!(dst, src[..len]);
         }
     }
 }

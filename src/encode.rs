@@ -16,9 +16,11 @@
 //! main loop only performs while at least 15 input bytes remain.
 
 use std::mem::MaybeUninit;
-use std::ptr;
 
-use crate::bytes::{copy_16, copy_exact, read_16, read_u32, read_u64, write_u32};
+use crate::bytes::{
+    copy_16, copy_exact, copy_long, read_16, read_u32, read_u64, write_u32,
+};
+use crate::layout::align_function_64;
 use crate::select::{opaque, select_if_below_2048, select_if_low_zero};
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
 
@@ -284,10 +286,10 @@ const REPLAY_MIN_TABLE_SIZE: usize = 1 << 12;
 fn clear_probed(input: &[u8], table: &mut [u16]) {
     debug_assert!(input.len() >= MIN_SEARCH_LEN);
     let ip_limit = input.len() - INPUT_MARGIN;
-    let mask = table.len() as u32 - 1;
+    let mask = hash_mask(table.len());
     let mut clear = |pos: usize| {
         let bytes = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
-        table[hash(bytes, mask)] = 0;
+        table[hash(bytes, mask) / 2] = 0;
     };
     let mut ip = 1;
     let mut skip = 32u32;
@@ -321,13 +323,45 @@ fn write_varint(output: &mut [MaybeUninit<u8>], mut value: u32) -> usize {
     i + 1
 }
 
-/// Index into a table of `mask + 1` entries for the four bytes `bytes`.
+/// Whether [`hash`] uses a CRC-32C instruction: where the build enables one
+/// (SSE4.2 on x86-64, the CRC extension on aarch64), as the C++
+/// implementation does then.
+const CRC_HASH: bool = cfg!(any(
+    all(target_arch = "x86_64", target_feature = "sse4.2"),
+    all(target_arch = "aarch64", target_feature = "crc"),
+));
+
+/// The mask [`hash`] takes for a table of `entries` entries: the byte mask
+/// for the CRC, the index mask for the multiply.
+#[inline(always)]
+fn hash_mask(entries: usize) -> u32 {
+    let mask = entries as u32 - 1;
+    if CRC_HASH { mask << 1 } else { mask }
+}
+
+/// Byte offset of the entry for the four bytes `bytes`, with `mask` from
+/// [`hash_mask`].
 ///
-/// This is the C++ implementation's multiplicative hash; keeping it, and
-/// taking the same bits, keeps the output identical.
+/// This is the C++ implementation's hash, which keeps the output identical
+/// to its output for the same CPU features: a CRC-32C instruction on the
+/// bytes and the table's byte mask (see [`CRC_HASH`]), and otherwise a
+/// multiply. The CRC replaces a multiply and a shift, and compressed text
+/// 1-6% faster on Apple M1, AMD Zen 4 and Neoverse-N2.
 #[inline(always)]
 fn hash(bytes: u32, mask: u32) -> usize {
-    ((bytes.wrapping_mul(0x1e35_a7bd) >> (32 - MAX_TABLE_BITS)) & mask) as usize
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+    // SAFETY: the build enables SSE4.2.
+    #[allow(unused_unsafe)]
+    return (unsafe { std::arch::x86_64::_mm_crc32_u32(bytes, mask) } & mask) as usize;
+    #[cfg(all(target_arch = "aarch64", target_feature = "crc"))]
+    // SAFETY: the build enables the CRC extension.
+    #[allow(unused_unsafe)]
+    return (unsafe { std::arch::aarch64::__crc32cw(bytes, mask) } & mask) as usize;
+    #[allow(unreachable_code)]
+    {
+        (((bytes.wrapping_mul(0x1e35_a7bd) >> (32 - MAX_TABLE_BITS)) & mask) as usize)
+            << 1
+    }
 }
 
 /// Compresses one block of at most `BLOCK_SIZE` bytes to `op`, returning
@@ -344,7 +378,7 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
     debug_assert!(table.len().is_power_of_two() && table.len() <= MAX_TABLE_SIZE);
     let base = input.as_ptr();
     let len = input.len();
-    let mask = table.len() as u32 - 1;
+    let mask = hash_mask(table.len());
     let table = table.as_mut_ptr();
     let mut op = op_start;
     // `ip` is the current input position. Table entries are positions in the
@@ -385,14 +419,28 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                             for k in 0..4 {
                                 let i = 4 * j + k;
                                 let dword = if i == 0 { preload } else { data as u32 };
-                                let entry = table.add(hash(dword, mask));
+                                let entry = table.byte_add(hash(dword, mask));
                                 candidate = usize::from(*entry);
-                                *entry = (ip + i) as u16;
+                                let pos = ip + i;
+                                *entry = pos as u16;
                                 if read_u32(base.add(candidate)) == dword {
-                                    // A literal of `i + 1 <= 16` bytes.
+                                    // A literal of `i + 1 <= 16` bytes. The 16
+                                    // probes share this code. On x86-64,
+                                    // hiding `pos` keeps LLVM from having
+                                    // every probe set a register to its `i`
+                                    // for it, which also cost a reload of
+                                    // `table` per probe: integer columns
+                                    // compressed 2-4% faster. aarch64 sets
+                                    // `i` only on the path that finds a match.
+                                    let pos = if cfg!(target_arch = "x86_64") {
+                                        opaque(pos)
+                                    } else {
+                                        pos
+                                    };
+                                    let i = pos - ip;
                                     *op = (i << 2) as u8;
                                     copy_16(base.add(next_emit), op.add(1));
-                                    ip += i;
+                                    ip = pos;
                                     op = op.add(i + 2);
                                     break 'found;
                                 }
@@ -404,7 +452,7 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                         skip += 16;
                     }
                     loop {
-                        let entry = table.add(hash(data as u32, mask));
+                        let entry = table.byte_add(hash(data as u32, mask));
                         let step = (skip >> 5) as usize;
                         skip += step as u32;
                         let next_ip = ip + step;
@@ -449,8 +497,9 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                     // `data` now holds at least five bytes from `ip`. Insert
                     // `ip - 1` too, to improve compression, and look up the
                     // next candidate.
-                    *table.add(hash(read_u32(base.add(ip - 1)), mask)) = (ip - 1) as u16;
-                    let entry = table.add(hash(data as u32, mask));
+                    *table.byte_add(hash(read_u32(base.add(ip - 1)), mask)) =
+                        (ip - 1) as u16;
+                    let entry = table.byte_add(hash(data as u32, mask));
                     candidate = usize::from(*entry);
                     *entry = ip as u16;
                     if data as u32 != read_u32(base.add(candidate)) {
@@ -462,6 +511,13 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
         }
     }
 
+    // The layout of the loop above decides how many of its branches cross
+    // or end on 32-byte boundaries, which costs 10-40% on cores with the JCC
+    // erratum (see `layout`). Pinning the function's alignment makes that
+    // layout independent of where the linker places it. With Rust 1.97 it
+    // made HTML and protobuf compress 40-47% faster; with Rust 1.88, whose
+    // placement was already a good one, it measured the same.
+    align_function_64();
     if ip < len {
         // SAFETY: the remaining output is covered by the bound.
         op = unsafe { emit_literal(op, base.add(ip), len - ip) };
@@ -508,44 +564,90 @@ unsafe fn find_match_length(
                 *data = a2 >> (shift & 24);
                 return ((shift >> 3) as usize, true);
             }
-            // Longer matches. Hiding the counter from LLVM keeps it from
-            // rewriting the loops to use more than one.
+            // Longer matches.
             let p2 = base.add(s2);
             let limit = ip_limit - s2;
-            matched = 8;
-            let limit_8 = limit.min(LONG_MATCH);
-            while matched < limit_8 {
-                let a1 = read_u64(s1.add(matched));
-                let a2 = read_u64(p2.add(matched));
-                if a1 != a2 {
-                    let xor = a1 ^ a2;
-                    let shift = xor.trailing_zeros();
-                    let a3 = read_u64(p2.add(matched + 4));
-                    let a2 = select_if_low_zero(xor, a3, a2);
-                    *data = a2 >> (shift & 24);
-                    return (matched + (shift >> 3) as usize, false);
-                }
-                matched = opaque(matched + 8);
+            #[cfg(target_arch = "aarch64")]
+            match long_match_aarch64(s1, p2, limit, data) {
+                Ok(found) => return found,
+                Err(compared) => matched = compared,
             }
-            // Long matches: 16 bytes at a time. Finding where such a match
-            // ends takes longer, but happens less often. The reads reach 23
-            // bytes past `p2 + matched`.
-            let limit_16 = limit.saturating_sub(7);
-            while matched < limit_16 {
-                if read_16(s1.add(matched)) != read_16(p2.add(matched)) {
-                    let low = read_u64(s1.add(matched)) ^ read_u64(p2.add(matched));
-                    let high =
-                        read_u64(s1.add(matched + 8)) ^ read_u64(p2.add(matched + 8));
-                    let bits = if low != 0 {
-                        low.trailing_zeros()
-                    } else {
-                        64 + high.trailing_zeros()
-                    };
-                    matched += (bits >> 3) as usize;
-                    *data = read_u64(p2.add(matched));
-                    return (matched, false);
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                // Hiding the counter from LLVM keeps it from rewriting the
+                // loops to use more than one.
+                matched = 8;
+                let limit_8 = limit.min(LONG_MATCH);
+                while matched < limit_8 {
+                    let a1 = read_u64(s1.add(matched));
+                    let a2 = read_u64(p2.add(matched));
+                    if a1 != a2 {
+                        let xor = a1 ^ a2;
+                        let shift = xor.trailing_zeros();
+                        let a3 = read_u64(p2.add(matched + 4));
+                        let a2 = select_if_low_zero(xor, a3, a2);
+                        *data = a2 >> (shift & 24);
+                        return (matched + (shift >> 3) as usize, false);
+                    }
+                    matched = opaque(matched + 8);
                 }
-                matched = opaque(matched + 16);
+                // Long matches: 16 bytes at a time. Finding where such a match
+                // ends takes longer, but happens less often. The reads reach 23
+                // bytes past `p2 + matched`.
+                let limit_16 = limit.saturating_sub(7);
+                macro_rules! compare_16 {
+                    ($limit:expr) => {
+                        while matched < $limit {
+                            if read_16(s1.add(matched)) != read_16(p2.add(matched)) {
+                                let low =
+                                    read_u64(s1.add(matched)) ^ read_u64(p2.add(matched));
+                                let high = read_u64(s1.add(matched + 8))
+                                    ^ read_u64(p2.add(matched + 8));
+                                let bits = if low != 0 {
+                                    low.trailing_zeros()
+                                } else {
+                                    64 + high.trailing_zeros()
+                                };
+                                matched += (bits >> 3) as usize;
+                                *data = read_u64(p2.add(matched));
+                                return (matched, false);
+                            }
+                            matched = opaque(matched + 16);
+                        }
+                    };
+                }
+                compare_16!(limit_16.min(VERY_LONG_MATCH));
+                // Past `VERY_LONG_MATCH` bytes, 32 bytes at a time with SSE2,
+                // while the reads stay within the 16-byte loop's reach, which
+                // then finds where the match ends: runs compressed 17-24%
+                // faster on AMD Zen 3. Taken from 64 bytes on, the extra exit
+                // cost the many matches that end soon after.
+                let limit_32 = limit.saturating_sub(23);
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                {
+                    use std::arch::x86_64::{
+                        __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128,
+                        _mm_movemask_epi8,
+                    };
+                    while matched < limit_32 {
+                        let a = s1.add(matched).cast::<__m128i>();
+                        let b = p2.add(matched).cast::<__m128i>();
+                        let equal = _mm_and_si128(
+                            _mm_cmpeq_epi8(_mm_loadu_si128(a), _mm_loadu_si128(b)),
+                            _mm_cmpeq_epi8(
+                                _mm_loadu_si128(a.add(1)),
+                                _mm_loadu_si128(b.add(1)),
+                            ),
+                        );
+                        if _mm_movemask_epi8(equal) != 0xffff {
+                            break;
+                        }
+                        matched = opaque(matched + 32);
+                    }
+                }
+                #[cfg(any(not(target_arch = "x86_64"), miri))]
+                let _ = limit_32;
+                compare_16!(limit_16);
             }
         }
         // The last bytes of the block, which often all match in small
@@ -582,9 +684,98 @@ unsafe fn find_match_length(
     (matched, matched < 8)
 }
 
-/// Matches are compared 8 bytes at a time up to this length, and 16 at a
-/// time after it.
+/// The loops of [`find_match_length`] for matches longer than 8 bytes, on
+/// aarch64, where they walk both pointers instead of adding a shared offset
+/// to each before the loads, so that a load can advance its pointer (`ldp
+/// x, x, [p], #16`); and they compare 32 bytes at a time with NEON.
+/// Returns the result when the match ends within the loops' range, else
+/// the length compared so far, from which the caller goes on.
+///
+/// # Safety
+///
+/// As for [`find_match_length`], with `p2 = base + s2` and `limit = ip_limit
+/// - s2`; the first 8 bytes match.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn long_match_aarch64(
+    s1: *const u8,
+    p2: *const u8,
+    limit: usize,
+    data: &mut u64,
+) -> std::result::Result<(usize, bool), usize> {
+    // SAFETY: as documented above; the reads stay where the shared-offset
+    // loops read, and the ends are within the block, as `s1 < p2`.
+    unsafe {
+        // Only `a` keeps the count, so that `b` serves the loads alone and
+        // both loads can advance their pointers.
+        let mut a = s1.add(8);
+        let mut b = p2.add(8);
+        let end_8 = s1.add(limit.min(LONG_MATCH));
+        while a < end_8 {
+            let a1 = read_u64(a);
+            let a2 = read_u64(b);
+            if a1 != a2 {
+                let matched = a.offset_from(s1) as usize;
+                let xor = a1 ^ a2;
+                let shift = xor.trailing_zeros();
+                let a3 = read_u64(p2.add(matched + 4));
+                let a2 = select_if_low_zero(xor, a3, a2);
+                *data = a2 >> (shift & 24);
+                return Ok((matched + (shift >> 3) as usize, false));
+            }
+            // Hidden from LLVM, which would otherwise turn both pointers
+            // back into one offset that each load adds first.
+            a = a.with_addr(opaque(a.addr() + 8));
+            b = b.with_addr(opaque(b.addr() + 8));
+        }
+        // Then 32 bytes at a time with NEON, while the reads stay within
+        // the 16-byte loop's reach; that loop then finds where the match
+        // ends. Runs compressed 28-44% faster on Neoverse-N2 and Apple M1.
+        #[cfg(not(miri))]
+        {
+            use std::arch::aarch64::{veorq_u8, vld1q_u8, vmaxvq_u8, vorrq_u8};
+            let end_32 = s1.add(limit.saturating_sub(23));
+            while a < end_32 {
+                let differ = vorrq_u8(
+                    veorq_u8(vld1q_u8(a), vld1q_u8(b)),
+                    veorq_u8(vld1q_u8(a.add(16)), vld1q_u8(b.add(16))),
+                );
+                if vmaxvq_u8(differ) != 0 {
+                    break;
+                }
+                a = a.with_addr(opaque(a.addr() + 32));
+                b = b.with_addr(opaque(b.addr() + 32));
+            }
+        }
+        let end_16 = s1.add(limit.saturating_sub(7));
+        while a < end_16 {
+            if read_16(a) != read_16(b) {
+                let matched = a.offset_from(s1) as usize;
+                let low = read_u64(a) ^ read_u64(p2.add(matched));
+                let high = read_u64(a.add(8)) ^ read_u64(p2.add(matched + 8));
+                let bits = if low != 0 {
+                    low.trailing_zeros()
+                } else {
+                    64 + high.trailing_zeros()
+                };
+                let matched = matched + (bits >> 3) as usize;
+                *data = read_u64(p2.add(matched));
+                return Ok((matched, false));
+            }
+            a = a.with_addr(opaque(a.addr() + 16));
+            b = b.with_addr(opaque(b.addr() + 16));
+        }
+        Err(a.offset_from(s1) as usize)
+    }
+}
+
+/// Matches are compared 8 bytes at a time up to this length, and 16 or 32
+/// at a time after it.
 const LONG_MATCH: usize = 64;
+
+/// On x86-64, matches longer than this are compared 32 bytes at a time.
+#[cfg(not(target_arch = "aarch64"))]
+const VERY_LONG_MATCH: usize = 256;
 
 /// Emits a literal inside the main loop, where up to 15 bytes may be read
 /// past it and written past its end.
@@ -616,7 +807,7 @@ unsafe fn emit_literal_fast(op: *mut u8, literal: *const u8, len: usize) -> *mut
                 }
             }
         } else {
-            ptr::copy_nonoverlapping(literal, op, len);
+            copy_long(literal, op, len);
         }
         op.add(len)
     }
