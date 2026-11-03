@@ -113,7 +113,14 @@ x86 or on Arm: decompression stays within 2.5% and compression is up to
 protobuf 11% faster but URLs 5% and 4 KiB blocks 7% slower. It runs the
 same instructions; its layout makes branches mispredict 41–56% less
 often on HTML and protobuf and 7–13% more often on URLs and 4 KiB
-blocks. Those builds were how the encoder's layout problem, and a
+blocks. On GitHub's AMD runners, BOLT compresses text 3.5–6% faster on
+Zen 3 and Zen 5 (single files 12% faster on Zen 3 and up to 26% on Zen
+5, where snipsnap otherwise compresses some texts at 0.87x C++'s speed)
+and 1–2% slower on Intel. Applied to the encoder's main function alone
+it gains as much, while moving that function's code by 16 to 48 bytes
+changes Zen 3 by 1%: the gain is BOLT's order of its blocks. Branch
+hints that reproduce the most visible changes of that order did not
+help. Those builds were how the encoder's layout problem, and a
 store-alignment problem in the decoding of long runs, were found and
 fixed in the source. Huge pages for malloc
 (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`) change less than 1%.
