@@ -164,8 +164,10 @@ detected at run time), snipsnap copies literals longer than 2 KiB in
 2 KiB pieces, which glibc copies with vector loads and stores. On Zen 3
 that decodes 64 KiB literals 18x as fast and compresses them 12x as fast,
 decodes the PDF case 6.3x as fast, and makes decompression 23% and
-compression 11% faster over the 24 cases. Zen 4, where `snap` and C++
-showed the same slow copies, has not been measured with it.
+compression 11% faster over the 24 cases. On Zen 4 it decodes 64 KiB
+literals 36% faster and compresses them 29% faster, and decompression is
+2.7% faster overall; without it, some output offsets compressed 64 KiB
+literals there at 2.6 GB/s.
 `GLIBC_TUNABLES=glibc.cpu.x86_rep_movsb_threshold=0x7fffffffffff` turns
 `rep movsb` off for the whole process instead, but on Zen 5, where it is
 fast, that made long literals 13–29% slower. The check is kept out of
