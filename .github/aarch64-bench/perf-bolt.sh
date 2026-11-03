@@ -18,7 +18,8 @@ for c in html pb urls text_4k_blocks; do
     echo "== misses $c ${b##*:}"
     taskset -c 1 perf record -q -e branch-misses:u -c 200 -o "$W/miss.data" \
       "${b%:*}" --only "encode:snipsnap:$c" --iters 400 > /dev/null 2>&1
-    perf script -i "$W/miss.data" -F sym,symoff 2>/dev/null | awk '{print $1}' \
+    perf script -i "$W/miss.data" -F ip,sym,symoff,dso 2>&1 | head -3
+    perf script -i "$W/miss.data" -F ip,sym,symoff 2>/dev/null | awk '{print ($2 == "" ? $1 : $2)}' \
       | sort | uniq -c | sort -rn | head -25
   done
 done
