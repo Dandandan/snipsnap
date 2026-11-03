@@ -143,7 +143,7 @@ pub(crate) unsafe fn copy_exact(from: *const u8, to: *mut u8, len: usize) {
 #[cfg_attr(not(target_arch = "x86_64"), inline(always))]
 pub(crate) unsafe fn copy_long(from: *const u8, to: *mut u8, len: usize) {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if len > LONG_COPY_PIECE && slow_rep_movsb() {
+    if len > LONG_COPY_PIECE && crate::cpu::amd_family_19h() {
         return unsafe { copy_in_pieces(from, to, len) };
     }
     unsafe { ptr::copy_nonoverlapping(from, to, len) }
@@ -165,38 +165,6 @@ unsafe fn copy_in_pieces(from: *const u8, to: *mut u8, len: usize) {
             done += LONG_COPY_PIECE;
         }
         ptr::copy_nonoverlapping(from.add(done), to.add(done), len - done);
-    }
-}
-
-/// Whether the CPU is an AMD family 19h core, Zen 3 or Zen 4, on which
-/// `rep movsb` is slow for some buffer addresses. Zen 5 (family 1Ah) copies
-/// faster with it.
-#[cfg(all(target_arch = "x86_64", not(miri)))]
-fn slow_rep_movsb() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    // 0: not yet known; then 1 + the answer.
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        0 => {
-            #[allow(unused_unsafe)]
-            // SAFETY: CPUID is available on every x86-64 CPU.
-            let (vendor, signature) = unsafe {
-                use std::arch::x86_64::__cpuid;
-                (__cpuid(0), __cpuid(1).eax)
-            };
-            let amd = (vendor.ebx, vendor.edx, vendor.ecx)
-                == (
-                    u32::from_le_bytes(*b"Auth"),
-                    u32::from_le_bytes(*b"enti"),
-                    u32::from_le_bytes(*b"cAMD"),
-                );
-            // The family is the base family plus the extended one.
-            let family = ((signature >> 8) & 0xf) + ((signature >> 20) & 0xff);
-            let slow = amd && family == 0x19;
-            STATE.store(1 + u8::from(slow), Ordering::Relaxed);
-            slow
-        }
-        state => state == 2,
     }
 }
 

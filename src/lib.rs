@@ -10,6 +10,8 @@ use std::mem::MaybeUninit;
 use std::slice;
 
 mod bytes;
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+mod cpu;
 mod decode;
 mod encode;
 mod layout;
