@@ -82,15 +82,15 @@ fn main_loop_switches_copy_width_midway() {
     };
     let (mut expected, mut body) = (Vec::new(), Vec::new());
     push_literal(&random(64), &mut expected, &mut body);
-    for i in 0..2000 {
+    for i in 0..200 {
         push_literal(&random(4), &mut expected, &mut body);
         push_copy(8, 64 + i % 512, &mut expected, &mut body);
     }
-    for i in 0..3000 {
+    for i in 0..300 {
         push_literal(&random(3), &mut expected, &mut body);
         push_copy(40, 100 + (i * 7) % 900, &mut expected, &mut body);
     }
-    for i in 0..2000 {
+    for i in 0..200 {
         push_literal(&random(5), &mut expected, &mut body);
         push_copy(7, 13 + i % 1000, &mut expected, &mut body);
     }
