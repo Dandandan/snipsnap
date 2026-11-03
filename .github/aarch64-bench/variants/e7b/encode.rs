@@ -16,9 +16,10 @@
 //! main loop only performs while at least 15 input bytes remain.
 
 use std::mem::MaybeUninit;
-use std::ptr;
 
-use crate::bytes::{copy_16, copy_exact, read_16, read_u32, read_u64, write_u32};
+use crate::bytes::{
+    copy_16, copy_exact, copy_long, read_16, read_u32, read_u64, write_u32,
+};
 use crate::layout::align_function_64;
 use crate::select::{opaque, select_if_below_2048, select_if_low_zero};
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
@@ -423,6 +424,7 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                                 let pos = ip + i;
                                 *entry = pos as u16;
                                 if read_u32(base.add(candidate)) == dword {
+                                    cold();
                                     // A literal of `i + 1 <= 16` bytes. The 16
                                     // probes share this code. On x86-64,
                                     // hiding `pos` keeps LLVM from having
@@ -456,12 +458,14 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                         skip += step as u32;
                         let next_ip = ip + step;
                         if next_ip > ip_limit {
+                            cold();
                             ip = next_emit;
                             break 'outer;
                         }
                         candidate = usize::from(*entry);
                         *entry = ip as u16;
                         if data as u32 == read_u32(base.add(candidate)) {
+                            cold();
                             break;
                         }
                         data = u64::from(read_u32(base.add(next_ip)));
@@ -768,6 +772,11 @@ unsafe fn long_match_aarch64(
     }
 }
 
+/// Marks the enclosing branch as unlikely for block layout.
+#[cold]
+#[inline(always)]
+fn cold() {}
+
 /// Matches are compared 8 bytes at a time up to this length, and 16 or 32
 /// at a time after it.
 const LONG_MATCH: usize = 64;
@@ -806,7 +815,7 @@ unsafe fn emit_literal_fast(op: *mut u8, literal: *const u8, len: usize) -> *mut
                 }
             }
         } else {
-            ptr::copy_nonoverlapping(literal, op, len);
+            copy_long(literal, op, len);
         }
         op.add(len)
     }
