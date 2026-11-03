@@ -385,10 +385,6 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
     // block, all of them before `ip`, so every candidate load below reads
     // initialized input.
     let mut ip = 0usize;
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::asm!(".skip 16, 0x90", options(nomem, nostack, preserves_flags));
-    }
 
     if len >= INPUT_MARGIN {
         // The search stops here. It is also the bound below which
@@ -496,6 +492,8 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                         emit_copy(op, offset, matched)
                     };
                     if ip >= ip_limit {
+                        #[cfg(target_arch = "x86_64")]
+                        cold_on_x86();
                         break 'outer;
                     }
                     // `data` now holds at least five bytes from `ip`. Insert
@@ -509,6 +507,8 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                     if data as u32 != read_u32(base.add(candidate)) {
                         break;
                     }
+                    #[cfg(target_arch = "x86_64")]
+                    cold_on_x86();
                 }
                 preload = (data >> 8) as u32;
             }
@@ -772,6 +772,11 @@ unsafe fn long_match_aarch64(
         Err(a.offset_from(s1) as usize)
     }
 }
+
+/// Marks the enclosing branch as unlikely for block layout, on x86-64.
+#[cold]
+#[inline(always)]
+fn cold_on_x86() {}
 
 /// Matches are compared 8 bytes at a time up to this length, and 16 or 32
 /// at a time after it.

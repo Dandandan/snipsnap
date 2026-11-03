@@ -12,14 +12,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-24.04, n: 1, ops: "encode", variants: "s*", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 2, ops: "encode", variants: "s*", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 3, ops: "encode", variants: "s*", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 4, ops: "encode", variants: "s*", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 5, ops: "encode", variants: "s*", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 6, ops: "encode", variants: "s*", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 7, ops: "encode", variants: "s*", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 8, ops: "encode", variants: "s*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 1, ops: "encode", variants: "e8*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 2, ops: "encode", variants: "e8*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 3, ops: "encode", variants: "e8*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 4, ops: "encode", variants: "e8*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 5, ops: "encode", variants: "e8*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 6, ops: "encode", variants: "e8*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 7, ops: "encode", variants: "e8*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 8, ops: "encode", variants: "e8*", targets: "plain:"}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
