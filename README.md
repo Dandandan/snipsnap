@@ -57,9 +57,9 @@ snappy 1.3.1 built with clang 18 (Apple's clang on macOS):
 
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
-| decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 6.8 GB/s | 3.4 GB/s | 4.2 GB/s |
-| decompress, AMD EPYC 7763 (Zen 3, GitHub's x86 runner) | 6.1 GB/s | 2.7 GB/s | 3.2 GB/s |
-| decompress, AMD EPYC 9V45 (Zen 5, GitHub's x86 runner) | 12.7 GB/s | 5.6 GB/s | 7.0 GB/s |
+| decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 6.9 GB/s | 3.4 GB/s | 4.2 GB/s |
+| decompress, AMD EPYC 7763 (Zen 3, GitHub's x86 runner) | 6.8 GB/s | 2.7 GB/s | 3.2 GB/s |
+| decompress, AMD EPYC 9V45 (Zen 5, GitHub's x86 runner) | 12.8 GB/s | 5.6 GB/s | 7.0 GB/s |
 | decompress, Arm Neoverse-N2 (GitHub's Arm runner) | 8.9 GB/s | 4.7 GB/s | 6.9 GB/s |
 | decompress, Apple M1 (GitHub's macOS runner, not pinned) | 8.6 GB/s | 4.2 GB/s | 6.5 GB/s |
 | compress, Intel Xeon | 2.4 GB/s | 2.1 GB/s | 2.2 GB/s |
@@ -75,25 +75,33 @@ small blocks:
 - Periodic data decompresses 3.6–39x as fast on x86 and 2.5–3.2x on Arm.
 - 256-byte blocks decompress 2.2–3.0x as fast.
 
-Text, HTML, URLs and protobuf decompress 1.07–1.11x as fast as C++ on
-Neoverse-N2, 1.03–1.10x on Apple M1 and 0.98–1.03x on Zen 5, and at 0.89–1.00x its speed on Zen 3 and
-0.96–0.99x on the Cascade Lake-class Xeon; 1.0–2.4x as fast as `snap`.
-On x86 the fast loop copies 64 bytes for every element instead of
-branching on its length. Copying 32 bytes and branching for longer
-elements made text 5–10% faster on Zen 4 and Zen 5 but ClickBench's
-pages, below, 5–17% slower. Where the CPU has AVX (detected at run time),
-that loop runs in a copy compiled with AVX, which copies the 64 bytes
-with two stores instead of four: 30% faster on text and 28% on
-ClickBench's pages on Zen 3, where the stores held the loop back, 2–4% on
-Zen 5, and 2% slower on text (0.4% overall) on the Cascade Lake-class
-Xeon.
+Text, HTML, URLs and protobuf decompress 1.07–1.19x as fast as C++ on
+Zen 3, 1.07–1.11x on Neoverse-N2, 1.03–1.10x on Apple M1, 0.99–1.06x on
+Zen 5 and 0.97–1.02x on the Cascade Lake-class Xeon; 1.0–2.4x as fast as
+`snap`. On x86 the fast loop copies 32 bytes of each element and
+branches for longer ones, until those turn out to be common, more than
+one per 128 bytes of output: it then finishes the block with a copy of
+itself that copies 64 bytes of every element, without the branch. Text,
+with almost no elements longer than 32 bytes, decodes 3.5–8% faster that
+way than with 64-byte copies throughout (21% on Zen 3), and ClickBench's
+pages, below, which switch within their first few KiB, as fast (8–9%
+faster on Zen 3, where the loop keeps the branch throughout, and on the
+Cascade Lake-class Xeon). With the branch throughout, those pages
+decoded 6–20% slower elsewhere. Where the CPU has AVX (detected at run
+time), that loop runs in a copy compiled with AVX, which copies with
+32-byte stores instead of 16-byte ones: with the 64-byte copies, 30%
+faster on text and 28% on ClickBench's pages on Zen 3, where the stores
+held the loop back, 2–4% on Zen 5, and 2% slower on text (0.4% overall)
+on the Cascade Lake-class Xeon.
 
-On ClickBench (`hits_0.parquet`: 728 Snappy pages, 378 MB decoded, mostly
-1 MB pages of titles and URLs), the pages decompress 1.03x as fast as C++
-on Arm, 1.06x on the Cascade Lake-class Xeon and on Zen 3 and 1.22x on
-Zen 5, and 1.5–2.5x as fast as `snap`. Weighted by the columns each of
-the 43 queries reads, x86 decompression measured 1.13x as fast as C++ on
-the Xeon. URLs, read by 10 of the queries, are most of that work.
+On ClickBench (`hits_0.parquet`: 728 Snappy pages, 378 MB decoded,
+mostly 1 MB pages of titles and URLs), the pages decompress 1.03x as
+fast as C++ on Arm, 1.08x on the Cascade Lake-class Xeon, 1.10–1.11x on
+Intel's Emerald and Granite Rapids Xeons, 1.14–1.15x on Zen 3 and Zen 4
+and 1.15–1.22x on Zen 5, and 1.5–2.5x as fast as `snap`. Weighted by the
+columns each of the 43 queries reads, x86 decompression measured 1.13x
+as fast as C++ on the Xeon. URLs, read by 10 of the queries, are most of
+that work.
 
 On Intel cores from Skylake to Cascade Lake with Intel's microcode update
 for the JCC erratum, a 32-byte block of code holding a branch that crosses
