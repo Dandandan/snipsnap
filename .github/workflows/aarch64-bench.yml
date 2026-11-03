@@ -12,14 +12,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-24.04, n: 1, ops: "decode", variants: "nb", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 2, ops: "decode", variants: "nb", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 3, ops: "decode", variants: "nb", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 4, ops: "decode", variants: "nb", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 5, ops: "decode", variants: "nb", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 6, ops: "decode", variants: "nb", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 7, ops: "decode", variants: "nb", targets: "plain:"}
-          - {os: ubuntu-24.04, n: 8, ops: "decode", variants: "nb", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 1, ops: "decode", variants: "*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 2, ops: "decode", variants: "*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 3, ops: "decode", variants: "*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 4, ops: "decode", variants: "*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 5, ops: "decode", variants: "*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 6, ops: "decode", variants: "*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 7, ops: "decode", variants: "*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 8, ops: "decode", variants: "*", targets: "plain:"}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
