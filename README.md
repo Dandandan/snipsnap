@@ -107,13 +107,16 @@ library's do not. On such a host, an earlier version of snipsnap measured
 against 3.1 GB/s on the 24 cases.
 
 Building snipsnap with profile-guided optimization, LLVM BOLT, both, or
-fat LTO, trained on the 24 cases, does not make it faster overall, on x86
-or on Arm: decompression stays within 2.5% and compression is up to 3%
-slower. Individual cases do move; on Arm, BOLT compresses HTML and
-protobuf 11% faster but URLs 5% and 4 KiB blocks 7% slower. Those builds
-were how the encoder's layout problem, and a store-alignment problem in
-the decoding of long runs, were found and fixed in the source. Huge pages
-for malloc (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`) change less than 1%.
+fat LTO, trained on the 24 cases, does not make it faster overall, on
+x86 or on Arm: decompression stays within 2.5% and compression is up to
+3% slower. Individual cases do move; on Arm, BOLT compresses HTML and
+protobuf 11% faster but URLs 5% and 4 KiB blocks 7% slower. It runs the
+same instructions; its layout makes branches mispredict 41–56% less
+often on HTML and protobuf and 7–13% more often on URLs and 4 KiB
+blocks. Those builds were how the encoder's layout problem, and a
+store-alignment problem in the decoding of long runs, were found and
+fixed in the source. Huge pages for malloc
+(`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`) change less than 1%.
 
 Long runs are also written with AVX stores where the CPU has AVX, which
 makes them 6–26% faster on the Cascade Lake-class Xeon and on Zen 3 and
