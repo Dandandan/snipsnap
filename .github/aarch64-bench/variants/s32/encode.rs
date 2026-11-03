@@ -385,6 +385,10 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
     // block, all of them before `ip`, so every candidate load below reads
     // initialized input.
     let mut ip = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::asm!(".skip 32, 0x90", options(nomem, nostack, preserves_flags));
+    }
 
     if len >= INPUT_MARGIN {
         // The search stops here. It is also the bound below which
@@ -424,7 +428,6 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                                 let pos = ip + i;
                                 *entry = pos as u16;
                                 if read_u32(base.add(candidate)) == dword {
-                                    cold();
                                     // A literal of `i + 1 <= 16` bytes. The 16
                                     // probes share this code. On x86-64,
                                     // hiding `pos` keeps LLVM from having
@@ -458,14 +461,12 @@ unsafe fn compress_block(input: &[u8], op_start: *mut u8, table: &mut [u16]) -> 
                         skip += step as u32;
                         let next_ip = ip + step;
                         if next_ip > ip_limit {
-                            cold();
                             ip = next_emit;
                             break 'outer;
                         }
                         candidate = usize::from(*entry);
                         *entry = ip as u16;
                         if data as u32 == read_u32(base.add(candidate)) {
-                            cold();
                             break;
                         }
                         data = u64::from(read_u32(base.add(next_ip)));
@@ -771,11 +772,6 @@ unsafe fn long_match_aarch64(
         Err(a.offset_from(s1) as usize)
     }
 }
-
-/// Marks the enclosing branch as unlikely for block layout.
-#[cold]
-#[inline(always)]
-fn cold() {}
 
 /// Matches are compared 8 bytes at a time up to this length, and 16 or 32
 /// at a time after it.
