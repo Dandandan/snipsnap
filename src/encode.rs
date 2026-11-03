@@ -16,9 +16,10 @@
 //! main loop only performs while at least 15 input bytes remain.
 
 use std::mem::MaybeUninit;
-use std::ptr;
 
-use crate::bytes::{copy_16, copy_exact, read_16, read_u32, read_u64, write_u32};
+use crate::bytes::{
+    copy_16, copy_exact, copy_long, read_16, read_u32, read_u64, write_u32,
+};
 use crate::layout::align_function_64;
 use crate::select::{opaque, select_if_below_2048, select_if_low_zero};
 use crate::{Error, MAX_BLOCK_LEN, Result, max_compress_len};
@@ -806,7 +807,7 @@ unsafe fn emit_literal_fast(op: *mut u8, literal: *const u8, len: usize) -> *mut
                 }
             }
         } else {
-            ptr::copy_nonoverlapping(literal, op, len);
+            copy_long(literal, op, len);
         }
         op.add(len)
     }
