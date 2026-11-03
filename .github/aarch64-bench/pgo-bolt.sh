@@ -48,10 +48,22 @@ fi
 if [ -x "$BOLT_DIR/llvm-bolt" ]; then
   echo "== BOLT ($BOLT_DIR)"
   bolt "$PLAIN" "$W/compare.bolt" && BUILDS="$BUILDS $W/compare.bolt:bolt"
+  # BOLT_EXTRA="name:options;name:options" applies more BOLT option sets to
+  # the plain build with the same profile; @CB@ stands for the mangled name
+  # of the encoder's compress_block.
+  CB=$(nm "$PLAIN" | grep -o '_RNvNtCs[A-Za-z0-9_]*8snipsnap6encode14compress_block$' | head -1)
+  IFS=';' read -ra bextras <<< "${BOLT_EXTRA:-}"
+  for e in "${bextras[@]}"; do
+    n=${e%%:*}; opts=${e#*:}; opts=${opts//@CB@/$CB}
+    echo "== BOLT $n: $opts"
+    # shellcheck disable=SC2086
+    "$BOLT_DIR/llvm-bolt" "$PLAIN" -o "$W/compare.bolt-$n" -data="$W/merged.fdata" $opts \
+      > "$W/bolt-$n.log" 2>&1 && BUILDS="$BUILDS $W/compare.bolt-$n:bolt-$n" || tail -3 "$W/bolt-$n.log"
+  done
   if [ -n "${DUMP:-}" ] && [ -x "$W/compare.bolt" ]; then
     # Disassembly of the functions matching DUMP, as BOLT laid them out
     # (hot part and split-off cold fragments) and in the plain build.
-    for bin in "$W/compare.bolt" "$PLAIN"; do
+    for bin in "$W/compare.bolt" "$PLAIN" "$W"/compare.bolt-*; do
       echo "== disassembly of $DUMP in $bin"
       objdump -d --no-show-raw-insn "$bin" | awk -v pat="$DUMP" '$0 ~ "^[0-9a-f]+ <.*" pat {p=1} p && /^$/ {p=0} p'
     done

@@ -36,11 +36,15 @@ jobs:
           cmake --build "$RUNNER_TEMP/snappy-build" -j4 && cmake --install "$RUNNER_TEMP/snappy-build"
       - name: Download a ClickBench partition
         run: curl -sSfL -o "$RUNNER_TEMP/hits_0.parquet" https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
-      - name: Output-offset sweep against the build without the Zen 3/4 copy
+      - name: Plain, BOLT, and BOLT of compress_block alone
         run: |
           lscpu | grep -E "Model name" || true
-          bash .github/aarch64-bench/sweep.sh "$RUNNER_TEMP/sweep" nofix 2>&1
-      - name: Plain, PGO, BOLT, PGO+BOLT and the build without the Zen 3/4 copy
-        run: |
-          lscpu | grep -E "Model name" || true
-          .github/aarch64-bench/pgo-bolt.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/pb" 2>&1
+          rm -rf .github/aarch64-bench/variants
+          SKIP_PGO=1 DUMP=8snipsnap6encode14compress_block \
+          BOLT_EXTRA="cb:-reorder-blocks=ext-tsp -split-functions -split-all-cold -funcs=@CB@;cb-nosplit:-reorder-blocks=ext-tsp -funcs=@CB@;cb-split:-reorder-blocks=none -split-functions -split-all-cold -funcs=@CB@" \
+            .github/aarch64-bench/pgo-bolt.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/pb" > "$RUNNER_TEMP/pb.txt" 2>&1 || true
+          grep -v "^ *[0-9a-f]*:" "$RUNNER_TEMP/pb.txt" | grep -v "^$"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: layout-${{ matrix.n }}
+          path: ${{ runner.temp }}/pb.txt
