@@ -58,12 +58,12 @@ snappy 1.3.1 built with clang 18 (Apple's clang on macOS):
 | | snipsnap | `snap` | C++ |
 |---|---|---|---|
 | decompress, Intel Xeon (Cascade Lake class, 2.8 GHz) | 6.8 GB/s | 3.4 GB/s | 4.2 GB/s |
-| decompress, AMD EPYC 7763 (Zen 3, GitHub's x86 runner) | 4.9 GB/s | 2.7 GB/s | 3.2 GB/s |
+| decompress, AMD EPYC 7763 (Zen 3, GitHub's x86 runner) | 6.1 GB/s | 2.7 GB/s | 3.2 GB/s |
 | decompress, AMD EPYC 9V45 (Zen 5, GitHub's x86 runner) | 12.7 GB/s | 5.6 GB/s | 7.0 GB/s |
 | decompress, Arm Neoverse-N2 (GitHub's Arm runner) | 8.9 GB/s | 4.7 GB/s | 6.9 GB/s |
 | decompress, Apple M1 (GitHub's macOS runner, not pinned) | 8.6 GB/s | 4.2 GB/s | 6.5 GB/s |
 | compress, Intel Xeon | 2.4 GB/s | 2.1 GB/s | 2.2 GB/s |
-| compress, AMD EPYC 7763 | 2.3 GB/s | 2.1 GB/s | 2.3 GB/s |
+| compress, AMD EPYC 7763 | 2.7 GB/s | 2.1 GB/s | 2.3 GB/s |
 | compress, AMD EPYC 9V45 | 4.5 GB/s | 3.7 GB/s | 4.2 GB/s |
 | compress, Arm Neoverse-N2 | 3.1 GB/s | 2.6 GB/s | 2.9 GB/s |
 | compress, Apple M1 | 3.2 GB/s | 2.5 GB/s | 2.9 GB/s |
@@ -151,16 +151,23 @@ the caller's buffer when they fit. On x86, reading an 8 MiB framed stream
 written by `snap` runs at 1.2–5.9 GB/s, 1.5–1.9x as fast as `snap`'s
 reader, and stored chunks read at 6.7–7.0 GB/s.
 
-Long literals are copied with glibc's `memcpy`, which uses `rep movsb`
-for blocks from about 2 KiB. On AMD Zen 3 and Zen 4 that instruction's
-speed depends on the buffers' addresses, so whichever library's buffers
-land badly copies at 3–5 GB/s instead of 25–50: on the Zen 4 runner,
-`snap` decoded the PDF case at 4.3 GB/s and, in another build, `snap`
-and C++ decoded 64 KiB literals at 3.5 GB/s.
+glibc's `memcpy` copies 2112 bytes and more with `rep movsb` on CPUs
+with fast short `rep movsb`. On AMD Zen 3 and Zen 4 that instruction's
+speed depends on the distance between the buffers, and copies that land
+badly run at 3–5 GB/s instead of 25–50. In the benchmark they landed
+badly on every Zen 3 runner, for all three libraries: 64 KiB literals
+decoded at 2.7–3.0 GB/s. On AMD family 19h CPUs (Zen 3 and Zen 4,
+detected at run time), snipsnap copies literals longer than 2 KiB in
+2 KiB pieces, which glibc copies with vector loads and stores. On Zen 3
+that decodes 64 KiB literals 18x as fast and compresses them 12x as fast,
+decodes the PDF case 6.3x as fast, and makes decompression 23% and
+compression 11% faster over the 24 cases. Zen 4, where `snap` and C++
+showed the same slow copies, has not been measured with it.
 `GLIBC_TUNABLES=glibc.cpu.x86_rep_movsb_threshold=0x7fffffffffff` turns
-it off and made all three steady there, with snipsnap's long literals
-4–8% faster, but on Zen 5, where `rep movsb` is fast, it made them 13–29%
-slower.
+`rep movsb` off for the whole process instead, but on Zen 5, where it is
+fast, that made long literals 13–29% slower. The check is kept out of
+line: inlined, it made HTML and protobuf compression 3–7% slower on
+Intel Xeons, which never take it.
 
 Other cases can still move by 10–30% with code layout (for all three
 libraries), so compare best-of-several runs. C++ snappy is tuned for clang;
