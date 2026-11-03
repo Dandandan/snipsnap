@@ -563,54 +563,96 @@ unsafe fn find_match_length(
                 *data = a2 >> (shift & 24);
                 return ((shift >> 3) as usize, true);
             }
-            // Longer matches.
+            // Longer matches. Hiding the counter from LLVM keeps it from
+            // rewriting the loops to use more than one.
             let p2 = base.add(s2);
             let limit = ip_limit - s2;
-            #[cfg(target_arch = "aarch64")]
-            match long_match_aarch64(s1, p2, limit, data) {
-                Ok(found) => return found,
-                Err(compared) => matched = compared,
+            matched = 8;
+            let limit_8 = limit.min(LONG_MATCH);
+            while matched < limit_8 {
+                let a1 = read_u64(s1.add(matched));
+                let a2 = read_u64(p2.add(matched));
+                if a1 != a2 {
+                    let xor = a1 ^ a2;
+                    let shift = xor.trailing_zeros();
+                    let a3 = read_u64(p2.add(matched + 4));
+                    let a2 = select_if_low_zero(xor, a3, a2);
+                    *data = a2 >> (shift & 24);
+                    return (matched + (shift >> 3) as usize, false);
+                }
+                matched = opaque(matched + 8);
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            // Long matches: 16 bytes at a time. Finding where such a match
+            // ends takes longer, but happens less often. The reads reach 23
+            // bytes past `p2 + matched`.
+            let limit_16 = limit.saturating_sub(7);
+            macro_rules! compare_16 {
+                ($limit:expr) => {
+                    while matched < $limit {
+                        if read_16(s1.add(matched)) != read_16(p2.add(matched)) {
+                            let low =
+                                read_u64(s1.add(matched)) ^ read_u64(p2.add(matched));
+                            let high = read_u64(s1.add(matched + 8))
+                                ^ read_u64(p2.add(matched + 8));
+                            let bits = if low != 0 {
+                                low.trailing_zeros()
+                            } else {
+                                64 + high.trailing_zeros()
+                            };
+                            matched += (bits >> 3) as usize;
+                            *data = read_u64(p2.add(matched));
+                            return (matched, false);
+                        }
+                        matched = opaque(matched + 16);
+                    }
+                };
+            }
+            compare_16!(limit_16.min(VERY_LONG_MATCH));
+            // Past `VERY_LONG_MATCH` bytes, 32 bytes at a time with SIMD
+            // while the reads stay within the 16-byte loop's reach, which
+            // then finds where the match ends. Taken earlier, the extra exit
+            // cost the many matches that end soon after 64 bytes.
+            let limit_32 = limit.saturating_sub(23);
+            #[cfg(all(target_arch = "aarch64", not(miri)))]
             {
-                // Hiding the counter from LLVM keeps it from rewriting the
-                // loops to use more than one.
-                matched = 8;
-                let limit_8 = limit.min(LONG_MATCH);
-                while matched < limit_8 {
-                    let a1 = read_u64(s1.add(matched));
-                    let a2 = read_u64(p2.add(matched));
-                    if a1 != a2 {
-                        let xor = a1 ^ a2;
-                        let shift = xor.trailing_zeros();
-                        let a3 = read_u64(p2.add(matched + 4));
-                        let a2 = select_if_low_zero(xor, a3, a2);
-                        *data = a2 >> (shift & 24);
-                        return (matched + (shift >> 3) as usize, false);
+                use std::arch::aarch64::{veorq_u8, vld1q_u8, vmaxvq_u8, vorrq_u8};
+                while matched < limit_32 {
+                    let (a, b) = (s1.add(matched), p2.add(matched));
+                    let differ = vorrq_u8(
+                        veorq_u8(vld1q_u8(a), vld1q_u8(b)),
+                        veorq_u8(vld1q_u8(a.add(16)), vld1q_u8(b.add(16))),
+                    );
+                    if vmaxvq_u8(differ) != 0 {
+                        break;
                     }
-                    matched = opaque(matched + 8);
-                }
-                // Long matches: 16 bytes at a time. Finding where such a
-                // match ends takes longer, but happens less often. The reads
-                // reach 23 bytes past `p2 + matched`.
-                let limit_16 = limit.saturating_sub(7);
-                while matched < limit_16 {
-                    if read_16(s1.add(matched)) != read_16(p2.add(matched)) {
-                        let low = read_u64(s1.add(matched)) ^ read_u64(p2.add(matched));
-                        let high =
-                            read_u64(s1.add(matched + 8)) ^ read_u64(p2.add(matched + 8));
-                        let bits = if low != 0 {
-                            low.trailing_zeros()
-                        } else {
-                            64 + high.trailing_zeros()
-                        };
-                        matched += (bits >> 3) as usize;
-                        *data = read_u64(p2.add(matched));
-                        return (matched, false);
-                    }
-                    matched = opaque(matched + 16);
+                    matched = opaque(matched + 32);
                 }
             }
+            #[cfg(all(target_arch = "x86_64", not(miri)))]
+            {
+                use std::arch::x86_64::{
+                    __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128,
+                    _mm_movemask_epi8,
+                };
+                while matched < limit_32 {
+                    let a = s1.add(matched).cast::<__m128i>();
+                    let b = p2.add(matched).cast::<__m128i>();
+                    let equal = _mm_and_si128(
+                        _mm_cmpeq_epi8(_mm_loadu_si128(a), _mm_loadu_si128(b)),
+                        _mm_cmpeq_epi8(
+                            _mm_loadu_si128(a.add(1)),
+                            _mm_loadu_si128(b.add(1)),
+                        ),
+                    );
+                    if _mm_movemask_epi8(equal) != 0xffff {
+                        break;
+                    }
+                    matched = opaque(matched + 32);
+                }
+            }
+            #[cfg(any(not(any(target_arch = "aarch64", target_arch = "x86_64")), miri))]
+            let _ = limit_32;
+            compare_16!(limit_16);
         }
         // The last bytes of the block, which often all match in small
         // blocks: 8 at a time, then the rest in one comparison of the eight
@@ -646,92 +688,12 @@ unsafe fn find_match_length(
     (matched, matched < 8)
 }
 
-/// The loops of [`find_match_length`] for matches longer than 8 bytes, on
-/// aarch64, where they walk both pointers so that the loads advance them
-/// (`ldr x, [p], #8`) instead of adding a shared offset to each first.
-/// Returns the result when the match ends within the loops' range, else
-/// the length compared so far, from which the caller goes on.
-///
-/// # Safety
-///
-/// As for [`find_match_length`], with `p2 = base + s2` and `limit = ip_limit
-/// - s2`; the first 8 bytes match.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn long_match_aarch64(
-    s1: *const u8,
-    p2: *const u8,
-    limit: usize,
-    data: &mut u64,
-) -> std::result::Result<(usize, bool), usize> {
-    // SAFETY: as documented above; the reads stay where the shared-offset
-    // loops read, and the ends are within the block, as `s1 < p2`.
-    unsafe {
-        // Only `a` keeps the count, so that `b` serves the loads alone and
-        // both loads can advance their pointers.
-        let mut a = s1.add(8);
-        let mut b = p2.add(8);
-        let end_8 = s1.add(limit.min(LONG_MATCH));
-        while a < end_8 {
-            let a1 = read_u64(a);
-            let a2 = read_u64(b);
-            if a1 != a2 {
-                let matched = a.offset_from(s1) as usize;
-                let xor = a1 ^ a2;
-                let shift = xor.trailing_zeros();
-                let a3 = read_u64(p2.add(matched + 4));
-                let a2 = select_if_low_zero(xor, a3, a2);
-                *data = a2 >> (shift & 24);
-                return Ok((matched + (shift >> 3) as usize, false));
-            }
-            // Hidden from LLVM, which would otherwise turn both pointers
-            // back into one offset that each load adds first.
-            a = a.with_addr(opaque(a.addr() + 8));
-            b = b.with_addr(opaque(b.addr() + 8));
-        }
-        // 32 bytes at a time with NEON while the reads stay 8 bytes short
-        // of where the 16-byte loop's reach; that loop then finds the end.
-        #[cfg(not(miri))]
-        {
-            use std::arch::aarch64::{veorq_u8, vld1q_u8, vmaxvq_u8, vorrq_u8};
-            let end_32 = s1.add(limit.saturating_sub(23));
-            while a < end_32 {
-                let differ = vorrq_u8(
-                    veorq_u8(vld1q_u8(a), vld1q_u8(b)),
-                    veorq_u8(vld1q_u8(a.add(16)), vld1q_u8(b.add(16))),
-                );
-                if vmaxvq_u8(differ) != 0 {
-                    break;
-                }
-                a = a.with_addr(opaque(a.addr() + 32));
-                b = b.with_addr(opaque(b.addr() + 32));
-            }
-        }
-        let end_16 = s1.add(limit.saturating_sub(7));
-        while a < end_16 {
-            if read_16(a) != read_16(b) {
-                let matched = a.offset_from(s1) as usize;
-                let low = read_u64(a) ^ read_u64(p2.add(matched));
-                let high = read_u64(a.add(8)) ^ read_u64(p2.add(matched + 8));
-                let bits = if low != 0 {
-                    low.trailing_zeros()
-                } else {
-                    64 + high.trailing_zeros()
-                };
-                let matched = matched + (bits >> 3) as usize;
-                *data = read_u64(p2.add(matched));
-                return Ok((matched, false));
-            }
-            a = a.with_addr(opaque(a.addr() + 16));
-            b = b.with_addr(opaque(b.addr() + 16));
-        }
-        Err(a.offset_from(s1) as usize)
-    }
-}
-
 /// Matches are compared 8 bytes at a time up to this length, and 16 at a
 /// time after it.
 const LONG_MATCH: usize = 64;
+
+/// Matches longer than this are compared 32 bytes at a time.
+const VERY_LONG_MATCH: usize = 256;
 
 /// Emits a literal inside the main loop, where up to 15 bytes may be read
 /// past it and written past its end.
