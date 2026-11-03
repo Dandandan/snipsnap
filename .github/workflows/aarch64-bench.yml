@@ -52,3 +52,46 @@ jobs:
             out=$("$b" --identical | grep "differ" || true)
             echo "== identical $(basename "$b"): $(echo "$out" | grep -vc " 0 of" || true) of $(echo "$out" | grep -c . || true) cases differ from C++"
           done
+
+  bolt:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+      - name: Build C++ snappy with clang, install BOLT and perf
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang cmake
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          for v in 21 20 19; do
+            echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$v main" | sudo tee /etc/apt/sources.list.d/llvm.list
+            if sudo apt-get update -q > /dev/null && sudo apt-get install -y -q "bolt-$v"; then break; fi
+          done
+          sudo apt-get install -y -q linux-tools-common "linux-tools-$(uname -r)" || true
+          echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+          git clone -q https://github.com/google/snappy.git "$RUNNER_TEMP/snappy-src"
+          git -C "$RUNNER_TEMP/snappy-src" checkout -q 9466064
+          cmake -S "$RUNNER_TEMP/snappy-src" -B "$RUNNER_TEMP/snappy-build" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBUILD_SHARED_LIBS=ON \
+            -DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/snappy"
+          cmake --build "$RUNNER_TEMP/snappy-build" -j4 && cmake --install "$RUNNER_TEMP/snappy-build"
+      - name: Download a ClickBench partition
+        run: curl -sSfL -o "$RUNNER_TEMP/hits_0.parquet" https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
+      - name: BOLT and counters
+        run: |
+          lscpu | grep -E "Model name" || true
+          mv .github/aarch64-bench/variants "$RUNNER_TEMP/variants-x86"
+          SKIP_PGO=1 DUMP=8snipsnap6encode14compress_block \
+            .github/aarch64-bench/pgo-bolt.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/pb" > "$RUNNER_TEMP/bolt.txt" 2>&1 || true
+          grep -v "^ *[0-9a-f]*:" "$RUNNER_TEMP/bolt.txt" | grep -v "^$" | head -200
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/snappy/lib" SNAPPY_CPP_PREFIX="$RUNNER_TEMP/snappy"
+          .github/aarch64-bench/perf-bolt.sh "$RUNNER_TEMP/pb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bolt
+          path: ${{ runner.temp }}/bolt.txt
