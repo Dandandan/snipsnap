@@ -140,6 +140,10 @@ same code, placed differently. Copying 64 bytes per element with AVX-512
 instead of AVX made decompression 1–9% slower on Zen 4 and on Intel Ice
 Lake and Cascade Lake Xeons, and BMI2 builds changed it by less than 1%.
 
+Matches longer than 64 bytes are compared 32 bytes at a time with NEON on
+aarch64, and past 256 bytes with SSE2 on x86-64: runs compressed 28–44%
+faster on Neoverse-N2 and Apple M1, and 17–24% faster on Zen 3.
+
 Framed streams check every chunk's CRC-32C with the CPU's CRC instructions
 where it has them (SSE4.2 on x86, the CRC extension on Arm, detected at run
 time), in three interleaved streams. The reader decodes chunks straight into
