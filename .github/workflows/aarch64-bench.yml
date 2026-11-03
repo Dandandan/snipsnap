@@ -12,10 +12,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-24.04, n: 1, ops: "decode encode", variants: z1, targets: "plain:"}
-          - {os: ubuntu-24.04, n: 2, ops: "decode encode", variants: z1, targets: "plain:"}
-          - {os: ubuntu-24.04, n: 3, ops: "decode encode", variants: z1, targets: "plain:"}
-          - {os: ubuntu-24.04, n: 4, ops: "decode encode", variants: z1, targets: "plain:"}
+          - {os: ubuntu-24.04, n: 1, ops: "decode encode", variants: "z1*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 2, ops: "decode encode", variants: "z1*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 3, ops: "decode encode", variants: "z1*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 4, ops: "decode encode", variants: "z1*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 5, ops: "decode encode", variants: "z1*", targets: "plain:"}
+          - {os: ubuntu-24.04, n: 6, ops: "decode encode", variants: "z1*", targets: "plain:"}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -44,7 +46,7 @@ jobs:
           TARGETS="${{ matrix.targets }}" VARIANTS="${{ matrix.variants }}" OPS="${{ matrix.ops }}" ROUNDS=3 \
             bash .github/aarch64-bench/ab.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/ab" 2>&1
       - name: Output-offset sweep
-        run: bash .github/aarch64-bench/sweep.sh "$RUNNER_TEMP/sweep" z1 2>&1
+        run: bash .github/aarch64-bench/sweep.sh "$RUNNER_TEMP/sweep" z1 z1c z1n 2>&1
       - name: Compressed bytes against C++
         run: |
           export DYLD_LIBRARY_PATH="$RUNNER_TEMP/snappy/lib" LD_LIBRARY_PATH="$RUNNER_TEMP/snappy/lib"
@@ -90,8 +92,10 @@ jobs:
             .github/aarch64-bench/pgo-bolt.sh "$RUNNER_TEMP/snappy" "$RUNNER_TEMP/hits_0.parquet" "$RUNNER_TEMP/pb" > "$RUNNER_TEMP/bolt.txt" 2>&1 || true
           grep -v "^ *[0-9a-f]*:" "$RUNNER_TEMP/bolt.txt" | grep -v "^$" | head -200
           export LD_LIBRARY_PATH="$RUNNER_TEMP/snappy/lib" SNAPPY_CPP_PREFIX="$RUNNER_TEMP/snappy"
-          .github/aarch64-bench/perf-bolt.sh "$RUNNER_TEMP/pb"
+          .github/aarch64-bench/perf-bolt.sh "$RUNNER_TEMP/pb" 2>&1 | tee "$RUNNER_TEMP/perf.txt"
       - uses: actions/upload-artifact@v4
         with:
           name: bolt
-          path: ${{ runner.temp }}/bolt.txt
+          path: |
+            ${{ runner.temp }}/bolt.txt
+            ${{ runner.temp }}/perf.txt
