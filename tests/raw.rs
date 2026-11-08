@@ -52,6 +52,56 @@ fn raw_copy2(len: usize, offset: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(&(offset as u16).to_le_bytes());
 }
 
+fn push_literal(bytes: &[u8], expected: &mut Vec<u8>, body: &mut Vec<u8>) {
+    raw_literal(bytes, body);
+    expected.extend_from_slice(bytes);
+}
+
+fn push_copy(len: usize, offset: usize, expected: &mut Vec<u8>, body: &mut Vec<u8>) {
+    raw_copy2(len, offset, body);
+    let start = expected.len() - offset;
+    for i in 0..len {
+        let byte = expected[start + i];
+        expected.push(byte);
+    }
+}
+
+/// Short elements, then 40-byte copies every 43 bytes of output, which make
+/// the x86-64 main loop give up on its branch for long elements and finish
+/// the block with 64-byte copies, then short elements again.
+#[test]
+fn main_loop_switches_copy_width_midway() {
+    let mut state = 0x9e37_79b9u32;
+    let mut random = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    };
+    let (mut expected, mut body) = (Vec::new(), Vec::new());
+    push_literal(&random(64), &mut expected, &mut body);
+    for i in 0..200 {
+        push_literal(&random(4), &mut expected, &mut body);
+        push_copy(8, 64 + i % 512, &mut expected, &mut body);
+    }
+    for i in 0..300 {
+        push_literal(&random(3), &mut expected, &mut body);
+        push_copy(40, 100 + (i * 7) % 900, &mut expected, &mut body);
+    }
+    for i in 0..200 {
+        push_literal(&random(5), &mut expected, &mut body);
+        push_copy(7, 13 + i % 1000, &mut expected, &mut body);
+    }
+    let mut compressed = Vec::new();
+    raw_header(expected.len(), &mut compressed);
+    compressed.extend_from_slice(&body);
+    assert_eq!(snipsnap::decompress(&compressed).unwrap(), expected);
+    let mut snap_decoder = snap::raw::Decoder::new();
+    assert_eq!(snap_decoder.decompress_vec(&compressed).unwrap(), expected);
+}
+
 #[test]
 fn roundtrip_snap_encoded_cases() {
     check_roundtrip(b"");
