@@ -139,7 +139,15 @@ Zen 5. With the AVX code chosen at run time, a build for
 `-Ctarget-cpu=x86-64-v3` decompresses at the same speed on Zen 3 and Zen
 5; it compresses long matches 12–17% slower on the Cascade Lake-class
 Xeon, whose `vptest` does not fuse with its branch, and 14–16% faster on
-Zen 3.
+Zen 3. A long match at a short distance is a run too: the encoder emits
+it as 64-byte copies with the same offset, and each would wait for the
+stores of the one before. Runs with offsets longer than 64 bytes are
+written with `memcpy`s that double in size, which the main loop looks
+for on x86-64 except on Zen 3 (the check cost Zen 3 5–9% and Neoverse-N2
+2–4% on data with many long elements, so they keep their code). Rows of
+repeating strings, one run at a distance of 79 bytes, decode 3.7–4.6x as
+fast on Emerald Rapids, Zen 4 and Zen 5: 30–77 GB/s, where C++ and
+`snap` decode them at 8–16.
 
 On Arm, building for a particular core changes little on Neoverse-N2. For
 `neoverse-n1`, `neoverse-n2`, `neoverse-v1`, `neoverse-v2`, `cortex-x2` or
