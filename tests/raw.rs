@@ -102,6 +102,50 @@ fn main_loop_switches_copy_width_midway() {
     assert_eq!(snap_decoder.decompress_vec(&compressed).unwrap(), expected);
 }
 
+/// Runs of identical 64-byte copies with offsets longer than 64 bytes, as
+/// the encoder emits for long matches: decoded as one run from three copies
+/// on, also at the end of the block and after other elements.
+#[test]
+fn long_period_runs() {
+    let mut state = 0x2545_f491u32;
+    let mut random = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    };
+    for offset in [65, 79, 127, 128, 256, 257, 1000] {
+        for count in [1, 2, 3, 4, 5, 9, 40] {
+            for tail in [0, 1, 70, 300] {
+                let (mut expected, mut body) = (Vec::new(), Vec::new());
+                for _ in 0..(offset / 50 + 2) {
+                    push_literal(&random(50), &mut expected, &mut body);
+                }
+                // A long element first, as the main loop looks for runs
+                // after one.
+                push_copy(40, 90, &mut expected, &mut body);
+                for _ in 0..count {
+                    push_copy(64, offset, &mut expected, &mut body);
+                }
+                for chunk in random(tail).chunks(60) {
+                    push_literal(chunk, &mut expected, &mut body);
+                }
+                push_copy(64, offset, &mut expected, &mut body);
+                let mut compressed = Vec::new();
+                raw_header(expected.len(), &mut compressed);
+                compressed.extend_from_slice(&body);
+                assert_eq!(
+                    snipsnap::decompress(&compressed).unwrap(),
+                    expected,
+                    "offset {offset}, count {count}, tail {tail}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn roundtrip_snap_encoded_cases() {
     check_roundtrip(b"");
