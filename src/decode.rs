@@ -22,8 +22,8 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use crate::bytes::{
-    copy_16_to_64, copy_exact, copy_short, read_32, read_u16, read_u32, read_u64,
-    write_16, write_32, write_u16, write_u32, write_u64,
+    copy_16_to_64, copy_exact, copy_long, copy_short, read_32, read_u16, read_u32,
+    read_u64, write_16, write_32, write_u16, write_u32, write_u64,
 };
 use crate::layout::{self, align_function_64};
 use crate::select::{opaque, select_if_zero, select_ptr_if_zero};
@@ -587,6 +587,14 @@ unsafe fn decode_tags<const UNROLL: usize, const WIDE: bool, const COPY64: bool>
                             );
                             #[cfg(target_arch = "x86_64")]
                             if adaptive {
+                                // A 64-byte copy followed by identical ones
+                                // is a long match; see `decode_run`. Looking
+                                // for them cost Neoverse-N2 2-4% and Zen 3
+                                // 5-9% on data with many long elements, so
+                                // only the adaptive loop does.
+                                if (tag == LONG_RUN_TAG) & starts_long_run(ip) {
+                                    break $exit;
+                                }
                                 long_copies += 1;
                                 let written = out.offset_from(out_start) as usize;
                                 if long_copies * LONG_SPACING > written + LONG_GRACE {
@@ -878,6 +886,11 @@ unsafe fn next_is_same(ip: *const u8, next_ip: *const u8, tag_type: usize) -> bo
 /// would make each copy wait for the previous stores to reach the cache,
 /// while [`fill_periodic`] reads only bytes written before the run.
 ///
+/// Offsets longer than `MAX_RUN_PERIOD` take three copies and go to
+/// [`fill_long_period`]: a long match at a short distance, such as rows of
+/// repeating strings, decoded 3.7x as fast that way (30 against 8 GB/s on an
+/// Emerald Rapids Xeon).
+///
 /// # Safety
 ///
 /// `ip < src.len()`, `op <= dst_len`, `dst` must be valid for `dst_len`
@@ -911,9 +924,10 @@ unsafe fn decode_run(
         _ => return None,
     };
     // `fill_periodic` reads 8 bytes before the run for short periods.
-    if offset == 0 || offset > op || offset > MAX_RUN_PERIOD || (offset < 8 && op < 8) {
+    if offset == 0 || offset > op || (offset < 8 && op < 8) {
         return None;
     }
+    let long = offset > MAX_RUN_PERIOD;
     // Leave room for the overshoot of `fill_periodic`.
     let max_count = (dst_len - op).saturating_sub(RUN_WRITE_SLOP) / len;
     // Elements are compared as masked four-byte words, which compiles to a
@@ -930,14 +944,73 @@ unsafe fn decode_run(
         count += 1;
         next += size;
     }
-    if count < 2 {
+    if count < if long { MIN_LONG_RUN } else { 2 } {
         return None;
     }
     let total = count * len;
     // SAFETY: `1 <= offset <= op` and the room for the fill's overshoot was
     // checked above.
-    unsafe { fill_periodic(dst.add(op), offset, total) };
+    unsafe {
+        if long {
+            fill_long_period(dst.add(op), offset, total);
+        } else {
+            fill_periodic(dst.add(op), offset, total);
+        }
+    }
     Some((next, op + total))
+}
+
+#[cfg(target_arch = "x86_64")]
+/// The tag of a 64-byte copy with a two-byte offset, which is how the
+/// encoder emits the pieces of a match longer than 67 bytes.
+const LONG_RUN_TAG: usize = (63 << 2) | 2;
+
+/// Identical copies it takes for [`decode_run`] to decode a run whose
+/// offset is longer than `MAX_RUN_PERIOD`.
+const MIN_LONG_RUN: usize = 3;
+
+#[cfg(target_arch = "x86_64")]
+/// The main loop leaves runs with longer offsets than this to itself: their
+/// copies read bytes stored long enough ago, and leaving the loop for them
+/// cost protobuf 1%.
+const LONG_RUN_MAX_OFFSET: u32 = 256;
+
+/// Whether the copy whose tag is at `ip - 1`, a `LONG_RUN_TAG`, is followed
+/// by `MIN_LONG_RUN - 1` identical ones.
+///
+/// # Safety
+///
+/// Nine bytes at `ip` must be readable.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn starts_long_run(ip: *const u8) -> bool {
+    unsafe {
+        let first = read_u32(ip.sub(1));
+        (((first ^ read_u32(ip.add(2))) | (first ^ read_u32(ip.add(5)))) & 0xff_ffff == 0)
+            & ((first >> 8) & 0xffff <= LONG_RUN_MAX_OFFSET)
+    }
+}
+
+/// Writes `total` bytes at `start` that repeat the `offset` bytes before it,
+/// for offsets too long for [`fill_periodic`], with `memcpy`s that double in
+/// size: each copies everything from the start of the pattern up to its own
+/// start, so no load depends on a store of the same copy, and all but the
+/// first few read bytes written long before.
+///
+/// # Safety
+///
+/// `offset >= 1` bytes before `start` initialized and `start[..total]`
+/// valid for writes.
+#[inline(always)]
+unsafe fn fill_long_period(start: *mut u8, offset: usize, total: usize) {
+    let mut pos = 0;
+    while pos < total {
+        // `pos` is a multiple of `offset`, so the pattern continues at
+        // `start + pos` as it began at `start - offset`.
+        let n = (total - pos).min(pos + offset);
+        unsafe { copy_long(start.sub(offset), start.add(pos), n) };
+        pos += n;
+    }
 }
 
 /// Writes `total` bytes at `start` that repeat the `offset` bytes before it,
