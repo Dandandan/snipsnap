@@ -579,11 +579,6 @@ unsafe fn decode_tags<const UNROLL: usize, const WIDE: bool, const COPY64: bool>
                         ptr::copy(pending_from, out, FAST_COPY);
                         if WIDE && pending_len > FAST_COPY {
                             cold();
-                            // A 64-byte copy followed by identical ones is a
-                            // long match; see `decode_run`.
-                            if tag == LONG_RUN_TAG && starts_long_run(ip) {
-                                break $exit;
-                            }
                             align_32::<UNROLL>();
                             ptr::copy(
                                 pending_from.add(FAST_COPY),
@@ -592,6 +587,14 @@ unsafe fn decode_tags<const UNROLL: usize, const WIDE: bool, const COPY64: bool>
                             );
                             #[cfg(target_arch = "x86_64")]
                             if adaptive {
+                                // A 64-byte copy followed by identical ones
+                                // is a long match; see `decode_run`. Looking
+                                // for them cost Neoverse-N2 2-4% and Zen 3
+                                // 5-9% on data with many long elements, so
+                                // only the adaptive loop does.
+                                if (tag == LONG_RUN_TAG) & starts_long_run(ip) {
+                                    break $exit;
+                                }
                                 long_copies += 1;
                                 let written = out.offset_from(out_start) as usize;
                                 if long_copies * LONG_SPACING > written + LONG_GRACE {
@@ -957,6 +960,7 @@ unsafe fn decode_run(
     Some((next, op + total))
 }
 
+#[cfg(target_arch = "x86_64")]
 /// The tag of a 64-byte copy with a two-byte offset, which is how the
 /// encoder emits the pieces of a match longer than 67 bytes.
 const LONG_RUN_TAG: usize = (63 << 2) | 2;
@@ -965,6 +969,7 @@ const LONG_RUN_TAG: usize = (63 << 2) | 2;
 /// offset is longer than `MAX_RUN_PERIOD`.
 const MIN_LONG_RUN: usize = 3;
 
+#[cfg(target_arch = "x86_64")]
 /// The main loop leaves runs with longer offsets than this to itself: their
 /// copies read bytes stored long enough ago, and leaving the loop for them
 /// cost protobuf 1%.
@@ -976,12 +981,13 @@ const LONG_RUN_MAX_OFFSET: u32 = 256;
 /// # Safety
 ///
 /// Nine bytes at `ip` must be readable.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn starts_long_run(ip: *const u8) -> bool {
     unsafe {
         let first = read_u32(ip.sub(1));
-        ((first ^ read_u32(ip.add(2))) | (first ^ read_u32(ip.add(5)))) & 0xff_ffff == 0
-            && (first >> 8) & 0xffff <= LONG_RUN_MAX_OFFSET
+        (((first ^ read_u32(ip.add(2))) | (first ^ read_u32(ip.add(5)))) & 0xff_ffff == 0)
+            & ((first >> 8) & 0xffff <= LONG_RUN_MAX_OFFSET)
     }
 }
 
